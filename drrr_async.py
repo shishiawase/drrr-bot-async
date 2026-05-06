@@ -128,7 +128,7 @@ class Later:
 class Bot:
 
     def __init__(self, name: str = '***', icon: str = 'setton',
-        device: str = 'Mozilla/5.0 (Linux; Android 7.1.2; SM-N975F Build/N2G48H; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.120 Mobile Safari/537.36', lang: str = 'en-US'):
+        device: str = 'Bot', lang: str = 'en-US'):
 
         self.logger = get_logger(f'DRRR({name[:20]})')
 
