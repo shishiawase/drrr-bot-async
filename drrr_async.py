@@ -243,9 +243,9 @@ class Bot:
         self.logger.info("Using Selenium for login...")
 
         try:
-            # Use regular Selenium with correct ChromeDriver version
             from webdriver_manager.chrome import ChromeDriverManager
-            driver_path = ChromeDriverManager(driver_version='147.0.7727.138').install()
+            
+            driver_path = ChromeDriverManager().install()
             self.logger.info(f"Using ChromeDriver at: {driver_path}")
 
             self.logger.info("Using regular Selenium...")
