@@ -90,7 +90,7 @@ bot = Bot(
 )
 ```
 
-**Available icons:** `setton`, `kanra`, `tanaka`, `kyo`, `zaika`, `san`, `rotchi`, `bakyura`, `gg`, `gaki`, `zawa`
+**Available icons:** `setton`, `bakyura-2x`, `bakyura`, `eight`, `gaki-2x`, `gg`, `junsui-2x`, `kakka`, `kanra`, `kanra-2x`, `kuromu-2x`, `kyo-2x`, `rotchi-2x`, `saki-2x`, `san-2x`, `setton-2x`, `sharo-2x`, `tanaka-2x`, `tanaka`, `zaika-2x`, `zaika`, `zawa`
 
 ### Core Methods
 
