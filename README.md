@@ -5,7 +5,7 @@ Asynchronous Python library for creating bots on [drrr.com](https://drrr.com).
 ## Features
 
 - Fully asynchronous (built on `aiohttp` and `asyncio`)
-- Two authentication methods (Selenium or manual challenge solving)
+- Browser-free authentication with challenge solving
 - Event system with decorators
 - Timers and delayed tasks
 - Moderation tools (kick, ban, whitelist/blacklist)
@@ -14,16 +14,12 @@ Asynchronous Python library for creating bots on [drrr.com](https://drrr.com).
 ## Requirements
 
 - Python 3.7+
-- Google Chrome (for Selenium authentication)
 
 ## Installation
 
 ```bash
 # Required
 pip install aiohttp
-
-# Recommended (for automatic authentication)
-pip install selenium webdriver-manager undetected-chromedriver
 ```
 
 ## Quick Start
@@ -34,7 +30,7 @@ from drrr_async import Bot
 
 async def main():
     async with Bot(name='MyBot', icon='setton') as bot:
-        if await bot.login(use_selenium=True, headless=True):
+        if await bot.login():
             bot.startLoop()
             
             @bot.event(types=['msg'], command=r'^!hello')
@@ -56,25 +52,17 @@ if __name__ == '__main__':
 
 ## Authentication
 
-### Selenium (Recommended)
+### Login
 
-Fast and reliable authentication through Chrome browser:
-
-```python
-# With visible browser
-await bot.login(use_selenium=True, headless=False)
-
-# Headless mode
-await bot.login(use_selenium=True, headless=True)
-```
-
-### Manual Challenge Solving
-
-Solves proof-of-work challenge in Python (slower, no browser required):
+Authentication uses the HTML login page directly:
 
 ```python
-await bot.login(use_selenium=False)
+await bot.login()
 ```
+
+The login flow requests the page, parses the token and challenge fields, solves the proof-of-work challenge, then submits the form with the challenged payload.
+
+If the challenge difficulty is `7`, solving can take a long time. It is recommended to check the challenge difficulty before solving; when it is `7`, wait before trying to register or log in again.
 
 ### Profile Persistence
 
@@ -86,7 +74,7 @@ bot.save('my_bot')
 if await bot.load('my_bot'):
     print("Profile loaded!")
 else:
-    await bot.login(use_selenium=True)
+    await bot.login()
 ```
 
 ## API Reference
@@ -108,7 +96,7 @@ bot = Bot(
 
 | Method | Description |
 |--------|-------------|
-| `await bot.login(use_selenium=True, headless=False)` | Login to drrr.com |
+| `await bot.login()` | Login to drrr.com |
 | `bot.save(name='config')` | Save profile to file |
 | `await bot.load(name='config')` | Load profile from file |
 | `bot.startLoop(seconds=0.8)` | Start update loop |
@@ -333,7 +321,7 @@ async def main():
     async with Bot(name='ModBot', icon='setton') as bot:
         # Load profile or login
         if not await bot.load('mod_bot'):
-            if not await bot.login(use_selenium=True, headless=True):
+            if not await bot.login():
                 return
             bot.save('mod_bot')
 
@@ -380,19 +368,6 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-```
-
-## Troubleshooting
-
-### "Selenium not available"
-```bash
-pip install selenium webdriver-manager undetected-chromedriver
-```
-
-### Challenge solving takes too long
-Use Selenium instead:
-```python
-await bot.login(use_selenium=True, headless=True)
 ```
 
 ### Bot doesn't respond to messages

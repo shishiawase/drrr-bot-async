@@ -8,25 +8,6 @@ import hashlib
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    import undetected_chromedriver as uc
-    SELENIUM_AVAILABLE = True
-    UNDETECTED_AVAILABLE = True
-except ImportError as e:
-    if 'undetected' in str(e):
-        SELENIUM_AVAILABLE = True
-        UNDETECTED_AVAILABLE = False
-    else:
-        SELENIUM_AVAILABLE = False
-        UNDETECTED_AVAILABLE = False
-
 DRRRUrl = 'https://drrr.com'
 
 @dataclass
@@ -219,203 +200,66 @@ class Bot:
         return None
 
 
-    async def login(self, use_selenium: bool = True, headless: bool = False):
-        """
-        Login to drrr.com
+    async def login(self):
+        # HTML login flow: GET / -> parse challenge -> POST / with challenged payload.
+        headers = {'User-Agent': self.profile['device'], 'Cookie': self.profile['cookie']}
 
-        Args:
-            use_selenium: If True, use Selenium to bypass challenge (recommended).
-                         If False, try to solve challenge with Python (very slow).
-            headless: If True, run browser in headless mode (no GUI).
-        """
-        if use_selenium and SELENIUM_AVAILABLE:
-            return await self._login_selenium(headless=headless)
-        else:
-            return await self._login_manual()
+        async with self.session.get(f'{DRRRUrl}/', headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as res:
+            html = await res.text()
 
+        token_m = re.search(r'name="token"[^>]*data-value="([^"]+)"', html)
+        nonce_m = re.search(r'name="nonce"\s+value="([^"]+)"', html)
+        ts_m = re.search(r'name="timestamp"\s+value="([^"]+)"', html)
+        diff_m = re.search(r'name="difficulty"\s+value="([^"]+)"', html)
 
-    async def _login_selenium(self, headless: bool = False):
-        """Login using Selenium to bypass challenge automatically"""
-        if not SELENIUM_AVAILABLE:
-            self.logger.error("Selenium not available. Install with: pip install selenium webdriver-manager undetected-chromedriver")
+        if not (token_m and nonce_m and ts_m and diff_m):
+            self.logger.error("Cannot parse token/challenge fields from HTML login page.")
             return False
 
-        self.logger.info("Using Selenium for login...")
-
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            
-            driver_path = ChromeDriverManager().install()
-            self.logger.info(f"Using ChromeDriver at: {driver_path}")
-
-            self.logger.info("Using regular Selenium...")
-            chrome_options = Options()
-            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            if headless:
-                chrome_options.add_argument('--headless=new')
-                self.logger.info("Running in headless mode")
-
-            service = Service(driver_path)
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-
-            driver.get('https://drrr.com')
-
-            # Wait for page load
-            wait = WebDriverWait(driver, 10)
-            name_input = wait.until(EC.presence_of_element_located((By.NAME, 'name')))
-
-            self.logger.info("Page loaded, filling form...")
-
-            # Fill form
-            name_input.clear()
-            name_input.send_keys(self.profile['name'])
-
-            # Select icon
-            icon_select = driver.find_element(By.NAME, 'icon')
-            for option in icon_select.find_elements(By.TAG_NAME, 'option'):
-                if option.get_attribute('value') == self.profile['icon']:
-                    option.click()
-                    break
-
-            self.logger.info("Form filled, clicking login button...")
-
-            # Click login button - this triggers challenge solving
-            submit_button = driver.find_element(By.NAME, 'login')
-            submit_button.click()
-
-            self.logger.info("Waiting for challenge to be solved and form to submit...")
-
-            # Wait for redirect (means challenge was solved and form submitted)
-            for i in range(60):  # 60 seconds max
-                await asyncio.sleep(1)
-                current_url = driver.current_url
-                if 'lounge' in current_url or 'room' in current_url:
-                    self.logger.info(f"Redirected successfully after {i+1}s")
-                    break
-                if i % 10 == 0 and i > 0:
-                    self.logger.info(f"Waiting for redirect... ({i}s)")
-            else:
-                self.logger.error("No redirect after 60 seconds")
-                driver.save_screenshot('no_redirect.png')
-                driver.quit()
-                return False
-
-            # Wait for redirect
-            self.logger.info("Login successful, getting cookies...")
-
-            for i in range(10):
-                await asyncio.sleep(1)
-                current_url = driver.current_url
-                if 'lounge' in current_url or 'room' in current_url:
-                    break
-
-            # Check current URL
-            current_url = driver.current_url
-            self.logger.info(f"Current URL: {current_url}")
-
-            # Check if we're logged in (lounge or room page)
-            if 'lounge' in current_url or 'room' in current_url:
-                # Get cookies
-                cookies = driver.get_cookies()
-                self.logger.info(f"Got {len(cookies)} cookies")
-
-                for cookie in cookies:
-                    if cookie['name'].startswith('drrr-session'):
-                        self.profile['cookie'] = f"{cookie['name']}={cookie['value']}"
-                        self.logger.info(f"Found session cookie: {cookie['name']}")
-                        break
-
-                driver.quit()
-
-                if self.profile['cookie']:
-                    await self.getProfile()
-
-                    # Auto-save profile after successful login
-                    self.save()
-
-                    self.logger.info("Login ok (Selenium)")
-                    return True
-                else:
-                    self.logger.error("No session cookie found")
-                    return False
-            else:
-                # Check for error messages
-                try:
-                    error_elem = driver.find_element(By.CLASS_NAME, 'error-message')
-                    self.logger.error(f"Error on page: {error_elem.text}")
-                except:
-                    pass
-
-                self.logger.error(f"Login failed - still on: {current_url}")
-                driver.save_screenshot('login_failed.png')
-                driver.quit()
-                return False
-
-        except Exception as e:
-            self.logger.error(f"Selenium login error: {e}")
-            import traceback
-            traceback.print_exc()
-            try:
-                driver.quit()
-            except:
-                pass
-            return False
-
-
-    async def _login_manual(self):
-        # Get token and authorization
-        r = await self._get(f'{DRRRUrl}/?api=json')
-
-        if not r.text or 'token' not in r.text:
-            self.logger.error(f"Failed to get token: {r.text}")
-            return False
-
-        # Check if challenge is present
-        if 'challenge' not in r.text:
-            self.logger.error("No challenge in response - server may have changed")
-            return False
-
-        challenge = r.text['challenge']
+        token = token_m.group(1)
+        challenge = {
+            'nonce': nonce_m.group(1),
+            'timestamp': ts_m.group(1),
+            'difficulty': int(diff_m.group(1)),
+        }
         self.logger.info(f"Challenge received (difficulty: {challenge.get('difficulty')})")
 
-        # Solve challenge
         solution = self._solve_challenge(challenge)
         if not solution:
             self.logger.error("Failed to solve challenge")
             return False
 
-        # Set authorization cookie
-        if r.text and 'authorization' in r.text:
-            self.profile['authorization'] = r.text['authorization']
-            self.profile['cookie'] = f"drrr-session-1={r.text['authorization']}"
-            self.logger.debug(f"Authorization: {self.profile['authorization']}")
-
-        self.profile['token'] = r.text['token']
-        self.logger.debug(f"Token: {self.profile['token']}")
-
-        # Login form with challenge solution as STRING (not dict)
         form = {
             'name': self.profile['name'],
-            'login': 'ENTER',
-            'token': self.profile['token'],
+            'tripcode': '',
+            'token': token,
+            'nonce': challenge['nonce'],
+            'timestamp': str(challenge['timestamp']),
+            'difficulty': str(challenge['difficulty']),
+            'challenged': solution,
             'language': self.profile['lang'],
             'icon': self.profile['icon'],
-            'challenged': solution  # Send as JSON string
         }
 
-        self.logger.debug(f"Sending login form with challenge solution")
-        t = await self._post(f'{DRRRUrl}/?api=json', form, use_json=False)
+        post_headers = {
+            'User-Agent': self.profile['device'],
+            'Cookie': self.profile['cookie'],
+            'Content-Type': 'application/x-www-form-urlencoded',
+        }
+        async with self.session.post(f'{DRRRUrl}/', headers=post_headers, data=form, timeout=aiohttp.ClientTimeout(total=10)) as res:
+            body = await res.text()
+            set_cookie = res.headers.get('set-cookie', '')
 
-        if t.text and 'error' in t.text:
-            self.logger.error(f"Login failed: {t.text.get('error', 'Unknown')}")
-            self.logger.debug(f"Full response: {t.text}")
+        if set_cookie:
+            self.profile['cookie'] = set_cookie.partition(';')[0]
+
+        ok = ('class=" lounge"' in body)
+        if not ok:
+            if 'Authorization error' in body:
+                self.logger.error('Login failed: authorization error page.')
+            else:
+                self.logger.error('Login failed: unexpected response body.')
             return False
-
-        if 'set-cookie' in t.headers:
-            cookie = t.headers['set-cookie'].partition(';')[0]
-            self.profile['cookie'] = cookie
 
         await self.getProfile()
         self.logger.info("Login ok")
@@ -537,9 +381,12 @@ class Bot:
     async def getProfile(self):
         r = await self._get(f'{DRRRUrl}/profile/?api=json')
         if r.status != 200:
-            return self.logger.warning(f"[getProfile]: {r.status} {r.text}")
+            self.logger.warning(f"[getProfile]: {r.status} {r.text}")
+            return r
 
-        self.profile.update(r.text.get('profile', {}))
+        if isinstance(r.text, dict):
+            self.profile.update(r.text.get('profile', {}))
+        return r
 
 
     async def getRoom(self):
@@ -982,7 +829,7 @@ class Bot:
 # async def main():
 #     async with Bot(name='MyBot', icon='setton') as bot:
 #         # Login
-#         if await bot.login(use_selenium=True, headless=False):
+#         if await bot.login():
 #             # Start update loop
 #             bot.startLoop(seconds=0.8)
 #
