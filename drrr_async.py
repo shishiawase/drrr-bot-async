@@ -166,7 +166,8 @@ class Bot:
         reuse_session: bool = True, session_name: Optional[str] = None,
         pow_workers: Optional[int] = None, pow_timeout: float = 300,
         tripcode: str = '', command_attempts: int = 3,
-        command_timeout: float = 30, command_interval: float = 1.1):
+        command_timeout: float = 30, command_interval: float = 1.1,
+        command_queue_limit: int = 64, event_timeout: float = 30):
 
         self.logger = get_logger(f'DRRR({name[:20]})')
 
@@ -182,6 +183,9 @@ class Bot:
         self.command_attempts = max(1, int(command_attempts))
         self.command_timeout = max(.01, float(command_timeout))
         self.command_interval = max(0, float(command_interval))
+        self.command_queue_limit = max(1, int(command_queue_limit))
+        self.event_timeout = max(.01, float(event_timeout))
+        self._pending_commands = 0
         self._last_command = 0
         if tripcode:
             self.session_name += '-' + hashlib.sha256(tripcode.encode()).hexdigest()[:12]
@@ -693,10 +697,17 @@ class Bot:
                 # Check if user/trip matches or no filter specified
                 if not config['users'] or talk.user in users or talk.trip in trips:
                     try:
-                        if asyncio.iscoroutinefunction(config['func']):
-                            await config['func'](talk)
-                        else:
-                            config['func'](talk)
+                        async def invoke():
+                            if asyncio.iscoroutinefunction(config['func']):
+                                return await config['func'](talk)
+                            result = await asyncio.to_thread(config['func'], talk)
+                            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                                return await result
+                            return result
+                        await asyncio.wait_for(invoke(), timeout=self.event_timeout)
+                    except asyncio.TimeoutError:
+                        self.logger.warning('Event handler timed out after %.2fs: %s',
+                                            self.event_timeout, handler_name)
                     except Exception:
                         self.logger.exception('Event handler failed: %s', handler_name)
 
@@ -754,14 +765,26 @@ class Bot:
             return Response(0, {}, None, 'timeout', 'Command time budget expired')
 
     async def __cmd(self, cmd):
-        async with self.queue_lock:
-            try:
+        if self._pending_commands >= self.command_queue_limit:
+            return Response(0, {}, None, 'rejected', 'Command queue is full')
+        self._pending_commands += 1
+
+        async def execute():
+            async with self.queue_lock:
                 wait = self.command_interval - (time.monotonic() - self._last_command)
                 if wait > 0:
                     await asyncio.sleep(wait)
-                return await self._cmd(cmd)
-            finally:
-                self._last_command = time.monotonic()
+                try:
+                    return await self._cmd(cmd)
+                finally:
+                    self._last_command = time.monotonic()
+
+        try:
+            return await asyncio.wait_for(execute(), timeout=self.command_timeout)
+        except asyncio.TimeoutError:
+            return Response(0, {}, None, 'timeout', 'Command time budget expired')
+        finally:
+            self._pending_commands -= 1
 
     async def _manage_userlist(self, list_type: str, add: List[str]=[], addAll: bool=False,
                          remove: List[str]=[], removeAll: bool=False, on: bool=None, mode: str=''):
@@ -947,10 +970,16 @@ class Bot:
         return await self.__cmd({'room_description': desc[:140]})
 
 
-    def _resolve_user(self, name=None, user_id=None):
+    def _resolve_user(self, name=None, user_id=None, *, allow_cached=False):
         if user_id:
-            return {'id': str(user_id), 'name': name or ''}
-        return self._find_user(name) or self._users.get(name)
+            user = next((u for u in self.users if str(u.get('id')) == str(user_id)), None)
+            return user or {'id': str(user_id), 'name': name or ''}
+        matches = [u for u in self.users if u.get('name') == name]
+        if len(matches) > 1:
+            return Response(0, {}, None, 'rejected', 'Ambiguous nickname; use user_id')
+        if allow_cached and name in self._users:
+            return self._users[name]
+        return matches[0] if matches else None
 
     async def host(self, name=None, *, user_id=None):
         return await self._user_action(name, 'new_host', user_id=user_id)
@@ -971,6 +1000,8 @@ class Bot:
 
     async def dm(self, name=None, msg: str = '', url: str = '', *, user_id=None, to_tc=None, loudness=None):
         user = self._resolve_user(name, user_id)
+        if isinstance(user, Response):
+            return user
         if not user:
             return Response(0, {}, None, 'rejected', 'User not found')
         extra = {'to': user['id']}
@@ -1006,7 +1037,9 @@ class Bot:
                         result.outcome, result.message, results)
 
     async def _user_action(self, name, key, *, user_id=None, save_user=False, extra=None):
-        user = self._resolve_user(name, user_id)
+        user = self._resolve_user(name, user_id, allow_cached=key == 'unban')
+        if isinstance(user, Response):
+            return user
         if not user:
             return Response(0, {}, None, 'rejected', 'User not found')
         result = await self.__cmd({key: user['id'], **(extra or {})})

@@ -495,8 +495,19 @@ async with Bot(name='MyBot', tripcode='your-tripcode',
 Retries reuse `X-Request-ID` and increment `X-Retry-Count`. Only transport
 failures and server errors are retried. Authorization failures and rate
 warnings terminate the command; choose a later retry explicitly.
-`command_timeout` limits execution including its retries; commands wait
-for the serialization lock before execution. Cancellation releases the lock.
+`command_timeout` (default 30 seconds) limits each command from entering the
+queue through spacing, sending, and retries. An expired command returns
+`timeout` and is removed from the queue. `command_queue_limit` (default 64)
+limits active and waiting commands together; overflow returns `rejected`
+with `Command queue is full`. Cancellation releases the lock and queue slot.
+Long messages consist of separate commands, each with its own time budget.
+
+`event_timeout` (default 30 seconds) limits each event handler. A timeout is
+logged and processing continues with the next handler/event. Async handlers
+must cooperate with cancellation and avoid blocking the event loop.
+Synchronous handlers run in a worker thread; they must be thread-safe, and
+a timed-out thread can continue running because Python cannot forcibly stop
+it. Prefer async handlers for network calls and bot commands.
 
 Additional APIs:
 
@@ -516,8 +527,10 @@ await bot.report('Alice', report_type='content',
 
 Nicknames must match exactly, including case. The bot and recipient must
 be in the same room for direct messages. If several participants share a
-nickname, the current lookup chooses the first match; use an ID to select
-a specific participant. Current participant IDs are available in `bot.users`:
+nickname, name-based commands return `rejected` with an ambiguous-nickname
+error; use an ID to select a specific participant. Name-based direct messages
+and moderation resolve current participants only. The ban cache is used only
+for `unban`, preferring the cached banned identity if a nickname is reused. Current participant IDs are available in `bot.users`:
 
 ```python
 for user in bot.users:
