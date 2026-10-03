@@ -5,8 +5,16 @@ import asyncio
 import logging
 import aiohttp
 import hashlib
-from dataclasses import dataclass
+import time
+import uuid
+import regex
+from html.parser import HTMLParser
+from collections import OrderedDict
+from drrr_socket import RoomSocket
+from drrr_pow import solve_challenge
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
+from urllib.parse import quote
 
 DRRRUrl = 'https://drrr.com'
 
@@ -14,7 +22,48 @@ DRRRUrl = 'https://drrr.com'
 class Response:
     status: int
     headers: dict
-    text: Optional[dict]
+    text: Any
+    outcome: str = ''
+    message: str = ''
+    parts: List['Response'] = field(default_factory=list)
+
+    @property
+    def ok(self):
+        return self.outcome in ('success', 'duplicate')
+
+    def classify(self):
+        if self.outcome:
+            return self
+        body = self.text
+        self.message = str(body.get('error') or body.get('message') or '') if isinstance(body, dict) else str(body or '')
+        if self.status == 208:
+            self.outcome = 'duplicate'
+        elif self.status == 429 or 'posting too fast' in self.message.lower():
+            self.outcome = 'rate_limited'
+        elif self.status >= 500:
+            self.outcome = 'server_error'
+        elif not 200 <= self.status < 300 or (isinstance(body, dict) and body.get('error')):
+            self.outcome = 'rejected'
+        elif isinstance(body, dict):
+            self.outcome = 'success'
+        elif not self.message or self.message.strip().lower() == 'ok' or self.message.lower().startswith(('room name is modified', 'room description is modified', 'room limit', 'now ', 'handover host', '/lounge')):
+            self.outcome = 'success'
+        else:
+            self.outcome = ('rejected' if self.message.lower().startswith(
+                ('user not found', 'forbidden', 'permission denied', 'error', 'invalid', 'cannot', 'you are', 'you cannot', 'only '))
+                else 'unknown')
+        return self
+
+
+class _FormFields(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.fields = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == 'input' and attrs.get('name'):
+            self.fields[attrs['name']] = attrs.get('value', attrs.get('data-value', ''))
 
 def read_json(name: str) -> Optional[dict]:
     if not os.path.isfile(f'./configs/{name}.json'):
@@ -32,11 +81,15 @@ def write_json(name: str, profile: dict):
         'name': profile['name'],
         'icon': profile['icon'],
         'cookie': profile['cookie'],
-        'device': profile['device']
+        'device': profile['device'],
+        'lang': profile.get('lang', 'en-US'),
+        'authorization': profile.get('authorization', '')
     }
 
-    with open(f'./configs/{name}.json', 'w', encoding='utf-8') as f:
+    target = f'./configs/{name}.json'
+    with open(target + '.tmp', 'w', encoding='utf-8') as f:
         json.dump(obj, f, indent=2)
+    os.replace(target + '.tmp', target)
 
 
 def get_logger(logger_name, level=logging.INFO):
@@ -109,13 +162,29 @@ class Later:
 class Bot:
 
     def __init__(self, name: str = '***', icon: str = 'setton',
-        device: str = 'Bot', lang: str = 'en-US'):
+        device: str = 'Bot', lang: str = 'en-US', *,
+        reuse_session: bool = True, session_name: Optional[str] = None,
+        pow_workers: Optional[int] = None, pow_timeout: float = 300,
+        tripcode: str = '', command_attempts: int = 3,
+        command_timeout: float = 30, command_interval: float = 1.1):
 
         self.logger = get_logger(f'DRRR({name[:20]})')
 
         # Create aiohttp session (will be initialized in async context)
         self.session: Optional[aiohttp.ClientSession] = None
         self.device = device
+        self.reuse_session = reuse_session
+        self.session_name = session_name or ('session-' + hashlib.sha256(
+            (name[:20] + '\0' + icon).encode()).hexdigest()[:16])
+        self.pow_workers = pow_workers
+        self.pow_timeout = pow_timeout
+        self.tripcode = tripcode
+        self.command_attempts = max(1, int(command_attempts))
+        self.command_timeout = max(.01, float(command_timeout))
+        self.command_interval = max(0, float(command_interval))
+        self._last_command = 0
+        if tripcode:
+            self.session_name += '-' + hashlib.sha256(tripcode.encode()).hexdigest()[:12]
 
         self.events: Dict[str, List] = {}
         self._users: Dict[str, dict] = {}
@@ -136,11 +205,14 @@ class Bot:
         self.rooms: List[dict] = []
         self.users: List[dict] = []
         self.lastTime: int = 0
-        self.loopId: Optional[Timer] = None
+        self.loopId: Optional[RoomSocket] = None
         self.queueON: bool = False
         self.loc: str = 'lounge'
         self.userlist: Dict[str, List[str]] = {'whitelist': [], 'blacklist': []}
         self.rule: dict = {'enable': False, 'type': '', 'mode': {'whitelist': 'kick', 'blacklist': 'kick'}}
+        self._room_generation = 0
+        self._seen_talks = OrderedDict()
+        self._baseline_time = 0
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -149,58 +221,47 @@ class Bot:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
-        if self.session:
-            await self.session.close()
-        
+        try:
+            await self.closeLoop()
+        finally:
+            if self.session:
+                await self.session.close()
 
-    def _solve_challenge(self, challenge: dict) -> Optional[str]:
-        """Solve proof-of-work challenge for anti-bot protection"""
-        nonce = challenge.get('nonce')
-        timestamp = challenge.get('timestamp')
-        difficulty = challenge.get('difficulty', 8)
 
-        if not nonce or not timestamp:
-            return None
-
-        self.logger.info(f"Solving challenge (difficulty: {difficulty})...")
-        self.logger.debug(f"  Nonce: {nonce}")
-        self.logger.debug(f"  Timestamp: {timestamp}")
-
-        # Format: nonce + timestamp + counter (SHA-256)
-        counter = 0
-        max_attempts = 100000000  # 100M attempts
-        target = '0' * difficulty
-
-        while counter < max_attempts:
-            solution = f"{nonce}{timestamp}{counter}"
-            hash_result = hashlib.sha256(solution.encode()).hexdigest()
-
-            # Check if hash starts with required number of zeros
-            if hash_result[:difficulty] == target:
-                self.logger.info(f"Challenge solved! Counter: {counter}, Hash: {hash_result[:20]}...")
-
-                # Return JSON object as expected by the server
-                result = json.dumps({
-                    "hash": hash_result,
-                    "nonce": nonce,
-                    "timestamp": str(timestamp),
-                    "counter": counter,
-                    "difficulty": str(difficulty)
-                }, separators=(',', ':'))  # No spaces after separators
-                self.logger.debug(f"Full solution: {result}")
-                return result
-
-            counter += 1
-
-            # Log progress every 1M attempts
-            if counter % 1000000 == 0:
-                self.logger.info(f"Progress: {counter // 1000000}M attempts...")
-
-        self.logger.error(f"Failed to solve challenge after {max_attempts} attempts")
-        return None
+    async def _solve_challenge(self, challenge: dict) -> Optional[str]:
+        """Solve PoW without blocking heartbeat; stop workers on cancellation."""
+        self.logger.info('Solving challenge (difficulty=%s) with up to %s workers',
+                         challenge.get('difficulty'), self.pow_workers or 4)
+        result = await solve_challenge(challenge, workers=self.pow_workers, timeout=self.pow_timeout)
+        if result is None:
+            self.logger.warning('Challenge time budget expired (%.1fs)', self.pow_timeout)
+        return result
 
 
     async def login(self):
+        requested_profile = self.profile.copy()
+        if self.reuse_session:
+            try:
+                cached = read_json(self.session_name)
+            except (OSError, ValueError):
+                cached = None
+            if (isinstance(cached, dict) and cached.get('cookie')
+                    and cached.get('name') == self.profile['name']
+                    and cached.get('icon') == self.profile['icon']):
+                self.profile['cookie'] = cached['cookie']
+                self.profile['authorization'] = cached.get('authorization', '')
+            if self.profile.get('cookie'):
+                profile = await self.getProfile()
+                current = profile.text.get('profile', {}) if isinstance(profile.text, dict) else {}
+                if profile.status == 200 and current.get('id') and current.get('name') == requested_profile['name']:
+                    self.logger.info('Reusing authenticated session')
+                    return True
+                if profile.status not in (200, 401, 403):
+                    raise aiohttp.ClientConnectionError('Cannot validate saved session')
+                self.profile = requested_profile
+                self.profile['cookie'] = ''
+                self.profile['authorization'] = ''
+                self.session.cookie_jar.clear()
         # HTML login flow: GET / -> parse challenge -> POST / with challenged payload.
         headers = {'User-Agent': self.profile['device'], 'Cookie': self.profile['cookie']}
 
@@ -224,14 +285,15 @@ class Bot:
         }
         self.logger.info(f"Challenge received (difficulty: {challenge.get('difficulty')})")
 
-        solution = self._solve_challenge(challenge)
+        # Proof of work must not block active sockets and their heartbeat.
+        solution = await self._solve_challenge(challenge)
         if not solution:
             self.logger.error("Failed to solve challenge")
             return False
 
         form = {
             'name': self.profile['name'],
-            'tripcode': '',
+            'tripcode': self.tripcode,
             'token': token,
             'nonce': challenge['nonce'],
             'timestamp': str(challenge['timestamp']),
@@ -249,46 +311,65 @@ class Bot:
         async with self.session.post(f'{DRRRUrl}/', headers=post_headers, data=form, timeout=aiohttp.ClientTimeout(total=10)) as res:
             body = await res.text()
             set_cookie = res.headers.get('set-cookie', '')
+            status = res.status
 
         if set_cookie:
             self.profile['cookie'] = set_cookie.partition(';')[0]
 
-        ok = ('class=" lounge"' in body)
-        if not ok:
-            if 'Authorization error' in body:
-                self.logger.error('Login failed: authorization error page.')
-            else:
-                self.logger.error('Login failed: unexpected response body.')
+        # Current server returns JSON instead of the historical lounge HTML.
+        try:
+            reply = json.loads(body)
+        except json.JSONDecodeError:
+            reply = {}
+        if not isinstance(reply, dict):
+            reply = {}
+        if status >= 400 or reply.get('error'):
+            self.logger.error('Login failed: server rejected authentication.')
             return False
-
-        await self.getProfile()
+        if 'authorization' in reply:
+            self.profile['authorization'] = reply['authorization']
+        profile = await self.getProfile()
+        if profile.status != 200 or not isinstance(profile.text, dict) or not profile.text.get('profile', {}).get('id'):
+            self.logger.error('Login failed: authenticated profile was not returned.')
+            return False
         self.logger.info("Login ok")
+        if self.reuse_session:
+            write_json(self.session_name, self.profile)
         return True
 
 
     async def _parse_json(self, res):
+        body = await res.text()
         try:
-            return await res.json()
-        except (json.JSONDecodeError, aiohttp.ContentTypeError):
-            return None
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return body
 
-    async def _post(self, url, cmd, use_json=False):
-        headers = {'Cookie': self.profile['cookie']}
+    async def _request(self, method, url, data=None, headers=None, use_json=False):
+        headers = {'Cookie': self.profile['cookie'], **(headers or {})}
+        options = {'headers': headers, 'timeout': aiohttp.ClientTimeout(total=10)}
+        if data is not None:
+            options['json' if use_json else 'data'] = data
+        try:
+            async with self.session.request(method, url, **options) as res:
+                body = await self._parse_json(res)
+                if isinstance(body, dict) and 'authorization' in body:
+                    self.profile['authorization'] = body['authorization']
+                if res.cookies:
+                    from http.cookies import SimpleCookie
+                    cookies = SimpleCookie(self.profile['cookie'])
+                    for key, value in res.cookies.items():
+                        cookies[key] = value.value
+                    self.profile['cookie'] = '; '.join(key + '=' + value.value for key, value in cookies.items())
+                return Response(res.status, dict(res.headers), body).classify()
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            return Response(0, {}, None, 'network_error', type(exc).__name__)
 
-        if use_json:
-            headers['Content-Type'] = 'application/json'
-            async with self.session.post(url, headers=headers, data=json.dumps(cmd), timeout=aiohttp.ClientTimeout(total=10)) as res:
-                return Response(res.status, dict(res.headers), await self._parse_json(res))
-        else:
-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
-            async with self.session.post(url, headers=headers, data=cmd, timeout=aiohttp.ClientTimeout(total=10)) as res:
-                return Response(res.status, dict(res.headers), await self._parse_json(res))
+    async def _post(self, url, cmd, use_json=False, headers=None):
+        return await self._request('POST', url, cmd, headers, use_json)
 
     async def _get(self, url):
-        headers = {'Cookie': self.profile['cookie']}
-        async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as res:
-            return Response(res.status, dict(res.headers), await self._parse_json(res))
-    
+        return await self._request('GET', url)
 
     def save(self, name: str = 'config'):
         write_json(name, self.profile)
@@ -303,7 +384,10 @@ class Bot:
         self.logger.name = f'DRRR({obj["name"]})'
         self.profile.update(obj)
         self.logger.info('Config loaded')
-        await self._update()
+        profile = await self.getProfile()
+        if not profile.ok or not self.profile.get('id'):
+            return False
+        await self._update(initial=True)
         return True
 
 
@@ -349,29 +433,15 @@ class Bot:
                 msg
             ))
         return result
-    
+
 
     def _splitMessage(self, message: str) -> List[dict]:
-        words = message.split()
-        messages = []
-        current_message = ""
-
-        for word in words:
-            if len(current_message) + len(word) + 1 <= 135:
-                current_message += word + " "
-            else:
-                messages.append({"message": current_message.strip()})
-                current_message = word + " "
-
-        if current_message:
-            messages.append({"message": current_message.strip()})
-
-        if "/me" in message:
-            for x in messages:
-                x['message'] = "/me " + x['message'].replace("/me", "").strip()
-
-        return messages
-    
+        prefix = '/me ' if message.startswith('/me ') else ''
+        content = message[len(prefix):]
+        clusters = regex.findall(r'\X', content)
+        size = 140 - len(prefix)
+        return [{'message': prefix + ''.join(clusters[i:i + size])}
+                for i in range(0, len(clusters), size)]
 
     def _find_user(self, name: str) -> Optional[dict]:
         """Find user by name in O(1) time"""
@@ -381,7 +451,7 @@ class Bot:
     async def getProfile(self):
         r = await self._get(f'{DRRRUrl}/profile/?api=json')
         if r.status != 200:
-            self.logger.warning(f"[getProfile]: {r.status} {r.text}")
+            self.logger.warning('[getProfile]: HTTP %s (%s)', r.status, r.outcome)
             return r
 
         if isinstance(r.text, dict):
@@ -398,13 +468,9 @@ class Bot:
 
 
     async def getRoomUpdate(self):
-        """Get room updates using fast polling endpoint"""
-        r = await self._get(f'{DRRRUrl}/json.php?fast=1')
-        if r.status != 200:
-            return self.logger.warning(f"[getRoomUpdate]: {r.status} {r.text}")
+        """Return the local room snapshot; updates arrive through Socket.IO."""
+        return dict(self.room)
 
-        return r.text
-    
 
     async def _checkMode(self, t, users):
         arr = []
@@ -433,89 +499,147 @@ class Bot:
 
 
     def startLoop(self, seconds=0.8):
+        """Start Socket.IO reception. seconds is the initial retry delay."""
+        if not self.session or self.session.closed:
+            raise RuntimeError('Use Bot inside an async context before startLoop()')
         if not self.loopId:
-            self.loopId = Timer(seconds, self._update)
+            self.loopId = RoomSocket(self, DRRRUrl, retry_delay=seconds)
             self.loopId.start()
-            self.logger.info(f'Loop started with {seconds}s interval')
+            self.logger.info('WebSocket reception started')
 
 
     def stopLoop(self):
         if self.loopId:
             self.loopId.stop()
-            self.loopId = None
-            self.logger.info('Loop stopped')
+            # Keep the receiver until cancellation finishes so closeLoop can await it.
+            receiver = self.loopId
+            def stopped(task):
+                if self.loopId is receiver:
+                    self.loopId = None
+            receiver.task.add_done_callback(stopped)
+            self.logger.info('WebSocket reception stopping')
 
+    async def closeLoop(self):
+        """Stop reception and wait for sockets and background tasks to close."""
+        receiver = self.loopId
+        if receiver:
+            await receiver.close()
+            if self.loopId is receiver:
+                self.loopId = None
 
-    async def _update(self):
-        url = DRRRUrl + '/json.php'
-        update = self.lastTime
+    def _reset_room(self):
+        self._room_generation += 1
+        self.lastTime = 0
+        self._baseline_time = 0
+        self._seen_talks.clear()
+        self.room = {}
+        self.users = []
 
-        if update:
-            url += f'?fast=1&update={update}'
+    def _remember_talk(self, talk):
+        key = str(talk.get('id') or hashlib.sha256(
+            json.dumps(talk, sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+        if key in self._seen_talks:
+            return False
+        self._seen_talks[key] = None
+        if len(self._seen_talks) > 2048:
+            self._seen_talks.popitem(last=False)
+        return True
 
-        try:
-            r = await self._get(url)
-            room = r.text or {}
+    def _apply_room_snapshot(self, data, initial=False, snapshot_started=None):
+        if not isinstance(data, dict) or data.get('error'):
+            return False
+        room = data.get('room', data)
+        if not isinstance(room, dict) or not any(k in room for k in ('id', 'room_id', 'users', 'talks')):
+            return False
+        self.room.update(room)
+        if 'users' in room:
+            self.users = room['users'] or []
+        elif 'users' in data:
+            self.users = data['users'] or []
+        self.room['users'] = self.users
+        self.loc = 'room'
+        if initial:
+            talks = data.get('talks', room.get('talks', [])) or []
+            for talk in talks:
+                self._remember_talk(talk)
+            cursor = data.get('update', room.get('update'))
+            self.lastTime = cursor or snapshot_started or max((t.get('time', 0) for t in talks), default=0)
+            self._baseline_time = self.lastTime
+        return True
 
-            # Debug logging
-            self.logger.debug(f"_update response keys: {list(room.keys()) if room else 'None'}")
-            if room.get('error'):
-                self.logger.debug(f"_update error: {room.get('error')}")
+    async def _update(self, initial=False):
+        """Fetch state once at startup/join/recovery, never on a polling timer."""
+        generation = self._room_generation
+        snapshot_started = time.time()
+        data = await self.getRoom()
+        if generation != self._room_generation:
+            return False
+        if data is None:
+            raise aiohttp.ClientConnectionError('Room snapshot unavailable')
+        return self._apply_room_snapshot(data, initial=initial, snapshot_started=snapshot_started)
 
-            # If we get "Not in room" error, we're definitely in lounge
-            if room.get('error') and 'Not in room' in room['error']:
-                await self.lounge()
-                self.loc = 'lounge'
-                self.logger.debug("_update: set loc to lounge (error)")
-                return
-
-            # If we have 'talks' key, we're definitely in a room
-            if 'talks' in room:
-                self.loc = 'room'
-                self.room = room
-                self.users = room.get('users') or self.users
-                self.logger.debug("_update: set loc to room (has talks)")
-            # If no talks but we have users list, we might be in a newly created room
-            elif room.get('users'):
-                self.loc = 'room'
-                self.room = room
-                self.users = room.get('users')
-                self.logger.debug("_update: set loc to room (has users)")
-            # If we get empty response and currently in room, stay in room
-            # (this happens right after creating a room)
-            elif self.loc == 'room':
-                self.logger.debug("_update: keeping loc as room (empty response, was in room)")
-                # Don't change location, keep current state
-            else:
-                # Empty response and we're not in room = we're in lounge
-                self.loc = 'lounge'
-                self.logger.debug("_update: set loc to lounge (empty response, was in lounge)")
-                return
-
-            # Only try to get room info if we don't have users and we're in a room
-            if not self.users and self.loc == 'room':
-                room_data = await self.getRoom()
-                if room_data and room_data.get('room'):
-                    self.users = room_data['room'].get('users') or []
-
-            lastTime = room.get('update') or 0
-
-            if self.lastTime < lastTime:
-                if not self.lastTime:
-                    self.lastTime = lastTime
-                    return
-
-                if 'talks' in room:
-                    lastTalks = self._talksFilter(room['talks'], self.lastTime)
-                    self.lastTime = lastTime
-
-                    if self.rule['enable']:
-                        await self._checkMode(self.rule['type'], self.users)
-                    await self._eventCall(self.events, lastTalks)
-        except aiohttp.ClientError as e:
-            self.logger.error(f'Update failed: {e}')
-        except Exception as e:
-            self.logger.error(f'Unexpected error in update: {e}')
+    async def _on_socket_event(self, event, data):
+        if event in ('leave', 'room-not-exist', 'not-in-any-room'):
+            self._reset_room()
+            self.loc = 'lounge'
+            if self.loopId:
+                self.loopId.restart()
+            return
+        if event in ('reload', 'version-update'):
+            if self.loopId:
+                self.loopId.restart()
+            return
+        if event == 'rewind-done':
+            if isinstance(data, dict):
+                self.lastTime = max(self.lastTime, data.get('now', 0))
+                if data.get('truncated'):
+                    self.logger.warning('Server recovery history truncated; some messages may be unavailable')
+                    await self._update()
+            return
+        if event == 'rewind':
+            talks = data.get('talks', []) if isinstance(data, dict) else []
+            for talk in sorted(talks, key=lambda t: t.get('time', 0)):
+                await self._on_socket_event('new-talk', talk)
+            return
+        if event != 'new-talk' or not isinstance(data, dict) or 'type' not in data:
+            return
+        timestamp = data.get('time', 0)
+        if timestamp < self._baseline_time or not self._remember_talk(data):
+            return
+        self.lastTime = max(self.lastTime, timestamp)
+        kind = data['type']
+        user = (data.get('to') if kind in ('kick', 'ban') else data.get('user')) or data.get('from') or {}
+        if kind == 'join' and user.get('id'):
+            self.users = [u for u in self.users if u.get('id') != user['id']] + [user]
+        elif kind in ('leave', 'timeout', 'kick', 'ban') and user.get('id'):
+            self.users = [u for u in self.users if u.get('id') != user['id']]
+        elif kind == 'room-profile':
+            self.room.update(data.get('profile') or {})
+        elif kind == 'new-host' and user.get('id'):
+            self.room['host'] = user['id']
+            for member in self.users:
+                member['is_host'] = member.get('id') == user['id']
+        elif kind == 'user-profile':
+            if 'all' in data:
+                self.users = data['all'] or []
+            for key in ('+', 'set'):
+                for member in data.get(key, []) or []:
+                    existing = next((u for u in self.users if u.get('id') == member.get('id')), None)
+                    if existing is None:
+                        self.users.append(dict(member))
+                    else:
+                        existing.update(member)
+            removed = {u['id'] for u in data.get('-', []) or []}
+            self.users = [u for u in self.users if u.get('id') not in removed]
+        self.room['users'] = self.users
+        history = self.room.setdefault('talks', [])
+        history.append(data)
+        del history[:-100]
+        self.room['update'] = self.lastTime
+        if self.rule['enable'] and kind == 'join':
+            await self._checkMode(self.rule['type'], self.users)
+        # Already deduplicated by ID; do not filter distinct equal timestamps.
+        await self._eventCall(self.events, self._talksFilter([dict(data, time=timestamp)], -1))
 
 
     def timer(self, seconds=0, minutes=0, hours=0, args: tuple = ()):
@@ -568,15 +692,18 @@ class Bot:
 
                 # Check if user/trip matches or no filter specified
                 if not config['users'] or talk.user in users or talk.trip in trips:
-                    if asyncio.iscoroutinefunction(config['func']):
-                        await config['func'](talk)
-                    else:
-                        config['func'](talk)
+                    try:
+                        if asyncio.iscoroutinefunction(config['func']):
+                            await config['func'](talk)
+                        else:
+                            config['func'](talk)
+                    except Exception:
+                        self.logger.exception('Event handler failed: %s', handler_name)
 
-        
+
     def event(self, types: List[str] = [], command: str = '', users: List[str] = []):
         type_list = ["msg", "dm", "me", "join", "leave", "new-host",
-        "new-description", "room-profile", "music", "kick", "ban"]
+        "new-description", "room-profile", "user-profile", "music", "playlist", "playlist-add", "kick", "ban", "unban"]
 
         for i in types:
             if i not in type_list:
@@ -596,38 +723,45 @@ class Bot:
 
             return wrapper()
         return actual_decorator
-    
+
 
     async def _cmd(self, cmd):
-        url = DRRRUrl + '/room/?ajax=1&api=json'
+        request_id = uuid.uuid4().hex
 
-        r = await self._post(url, cmd)
-        while r.status not in {200, 500}:
-            self.logger.warning(f"[{list(cmd.keys())[0]}]: {r.status} {r.text}")
-            await asyncio.sleep(0.5)
-            r = await self._post(url, cmd)
+        async def send():
+            last = Response(0, {}, None, 'network_error')
+            for attempt in range(self.command_attempts):
+                try:
+                    last = await self._post(DRRRUrl + '/room/?ajax=1&api=json', cmd,
+                        headers={'X-Request-ID': request_id, 'X-Retry-Count': str(attempt)})
+                    last.classify()
+                    if isinstance(last.text, dict) and last.text.get('redirect') and 'leave' not in cmd:
+                        if str(last.text['redirect']).strip('/') != 'room':
+                            last.outcome = 'rejected'
+                    # Never replay logical failures: an already handled ID can
+                    # return 208 even if its original response was a warning.
+                    if last.outcome not in ('server_error', 'network_error'):
+                        return last
+                except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+                    last = Response(0, {}, None, 'network_error', type(exc).__name__)
+                if attempt + 1 < self.command_attempts:
+                    await asyncio.sleep(min(2 ** attempt, 4))
+            return last
 
-        return r
-
+        try:
+            return await asyncio.wait_for(send(), timeout=self.command_timeout)
+        except asyncio.TimeoutError:
+            return Response(0, {}, None, 'timeout', 'Command time budget expired')
 
     async def __cmd(self, cmd):
         async with self.queue_lock:
-            self.queue.append(cmd)
-
-            if not self.queueON:
-                self.queueON = True
-                await self._cmd(self.queue.pop(0))
-
-                async def q():
-                    async with self.queue_lock:
-                        if len(self.queue):
-                            await self._cmd(self.queue.pop(0))
-                            Later(1.0, q).start()
-                        else:
-                            self.queueON = False
-
-                Later(1.0, q).start()
-    
+            try:
+                wait = self.command_interval - (time.monotonic() - self._last_command)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                return await self._cmd(cmd)
+            finally:
+                self._last_command = time.monotonic()
 
     async def _manage_userlist(self, list_type: str, add: List[str]=[], addAll: bool=False,
                          remove: List[str]=[], removeAll: bool=False, on: bool=None, mode: str=''):
@@ -676,14 +810,17 @@ class Bot:
     async def lounge(self):
         r = await self._get(f'{DRRRUrl}/lounge?api=json')
         if r.status != 200:
-            return self.logger.warning(f"[Lounge]: {r.status} {r.text}")
-
+            return r
+        if not isinstance(r.text, dict) or 'rooms' not in r.text:
+            r.outcome = 'rejected'
+            return r
         self.rooms = r.text.get('rooms') or []
+        return r
 
 
     async def create(self, name: str = 'Just', desc: str = '', limit: int = 5,
                lang: str = 'en-US', music: bool = False, adult: bool = False,
-               hidden: bool = False):
+               hidden: bool = False, *, music_full_mode: bool = False):
         form = {
             'name': name[:20],
             'description': desc[:140],
@@ -694,42 +831,106 @@ class Bot:
 
         if music:
             form['music'] = 'true'
+        if music_full_mode:
+            form['music_full_mode'] = 'true'
         if adult:
             form['adult'] = 'true'
         if hidden:
             form['conceal'] = 'true'
 
         r = await self._post(f'{DRRRUrl}/create_room/?api=json', form)
-        if r.text and 'error' in r.text:
+        if isinstance(r.text, dict) and r.text.get('error'):
             self.logger.warning(f"[Create]: {r.text['error']}")
-        if r.status != 200:
-            self.logger.warning(f"[Create]: {r.status} {r.text}")
+            return r.classify()
+        if not r.classify().ok:
+            self.logger.warning('[Create]: HTTP %s (%s)', r.status, r.outcome)
             return r
 
         # Explicitly set location to room after creating
+        self._reset_room()
         self.loc = 'room'
         self.logger.debug("create: set loc to room")
-        await self._update()
+        try:
+            confirmed = await self._update(initial=True)
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            self._reset_room()
+            self.loc = 'lounge'
+            return Response(0, {}, None, 'network_error', type(exc).__name__)
+        if not confirmed:
+            self._reset_room()
+            self.loc = 'lounge'
+            return Response(r.status, r.headers, r.text, 'rejected', 'Room creation not confirmed')
+        r.outcome = 'success'
+        if self.loopId:
+            self.loopId.restart()
         return r
 
 
     async def join(self, id: str):
-        r = await self._get(f'{DRRRUrl}/room/?id={id}&api=json')
-        if r.text and 'error' in r.text:
-            self.logger.warning(f"[Join]: {r.text['error']}")
-            # Don't set location if join failed
-            return r
-        if r.status != 200:
-            self.logger.warning(f"[Join]: {r.status} {r.text}")
-            # Don't set location if join failed
-            return r
-
-        # Explicitly set location to room after successful join
-        self.loc = 'room'
-        self.logger.debug("join: set loc to room")
-        await self._update()
-        return r
-
+        target = str(id)
+        try:
+            reply = await self._get(f'{DRRRUrl}/room/?id={quote(target, safe="")}&api=json')
+            if reply.status == 0 or reply.status == 401 or reply.status >= 500:
+                return reply.classify()
+            if isinstance(reply.text, dict) and reply.text.get('error'):
+                return reply.classify()
+            if isinstance(reply.text, dict) and 'redirect' in reply.text:
+                redirect = str(reply.text['redirect']).strip('/')
+                if redirect not in ('room', 'room_join'):
+                    reply.outcome = 'rejected'
+                    return reply
+            for attempt in range(2):
+                data = await self.getRoom()
+                room = data.get('room', data) if isinstance(data, dict) else {}
+                members = room.get('users', [])
+                own_id = self.profile.get('id')
+                room_id = room.get('roomId', room.get('id'))
+                if str(room_id) == target and own_id and any(u.get('id') == own_id for u in members):
+                    self._reset_room()
+                    self._apply_room_snapshot(data, initial=True, snapshot_started=time.time())
+                    if self.loopId:
+                        self.loopId.restart()
+                    return Response(200, reply.headers, reply.text, 'success')
+                if attempt == 1:
+                    break
+                page = await self._get(f'{DRRRUrl}/room_join/?id={quote(target, safe="")}')
+                body, status = page.text, page.status
+                if isinstance(body, dict):
+                    if body.get('error'):
+                        return Response(status, {}, body).classify()
+                    if 'redirect' in body and str(body['redirect']).strip('/') != 'room':
+                        return Response(status, {}, body, 'rejected', str(body.get('message') or 'Join refused'))
+                    if str(body.get('redirect', '')).strip('/') == 'room':
+                        # A removed member can retain stale room state server-side.
+                        # Its JSON "Already in room" is not proof of membership.
+                        left = await self.__cmd({'leave': 'leave'})
+                        if not left.ok:
+                            return left
+                        self._reset_room()
+                        self.loc = 'lounge'
+                        page = await self._get(f'{DRRRUrl}/room_join/?id={quote(target, safe="")}')
+                        body, status = page.text, page.status
+                        if status < 200 or status >= 400 or (isinstance(body, dict) and body.get('error')):
+                            return page.classify()
+                elif status < 200 or status >= 400:
+                    return Response(status, {}, body).classify()
+                fields = _FormFields()
+                if isinstance(body, str):
+                    fields.feed(body)
+                challenge = fields.fields
+                solution = ''
+                if all(challenge.get(k) for k in ('nonce', 'timestamp', 'difficulty')):
+                    solution = await self._solve_challenge({
+                        'nonce': challenge['nonce'], 'timestamp': challenge['timestamp'],
+                        'difficulty': int(challenge['difficulty'])})
+                    if solution is None:
+                        return Response(0, {}, None, 'timeout', 'Room challenge expired')
+                reply = await self._post(f'{DRRRUrl}/room/?api=json', {'id': target, 'challenged': solution})
+                if not reply.classify().ok:
+                    return reply
+            return Response(reply.status, reply.headers, reply.text, 'rejected', 'Room membership not confirmed')
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            return Response(0, {}, None, 'network_error', type(exc).__name__)
 
     async def title(self, name: str):
         name = name[:20]
@@ -746,84 +947,145 @@ class Bot:
         return await self.__cmd({'room_description': desc[:140]})
 
 
-    async def host(self, name: str):
-        u = self._find_user(name)
-        if not u:
-            return self.logger.warning(f"[Host]: {name} - not found.")
-        return await self.__cmd({'new_host': u['id']})
+    def _resolve_user(self, name=None, user_id=None):
+        if user_id:
+            return {'id': str(user_id), 'name': name or ''}
+        return self._find_user(name) or self._users.get(name)
 
+    async def host(self, name=None, *, user_id=None):
+        return await self._user_action(name, 'new_host', user_id=user_id)
 
     async def dj(self, mode: bool):
-        return await self.__cmd({'dj_mode': mode})
+        return await self.__cmd({'dj_mode': str(bool(mode)).lower()})
 
+    async def music(self, name: str, url: str, *, queue=None):
+        if queue not in (None, 'first', 'last'):
+            raise ValueError('queue must be first, last or None')
+        data = {'music': 'music', 'name': name, 'url': url}
+        if queue:
+            data['add-to-playlist'] = queue
+        return await self.__cmd(data)
 
-    async def music(self, name: str, url: str):
-        return await self.__cmd({'music': 'music', 'name': name, 'url': url})
+    async def msg(self, msg: str, url: str = '', *, loudness=None, mention=None):
+        return await self._send_messages(msg, url, loudness=loudness, mention=mention)
 
-
-    async def msg(self, msg: str, url: str = ''):
-        messages = self._splitMessage(msg)
-
-        if url:
-            messages[0]['url'] = url
-        for x in messages:
-            await self.__cmd(x)
-
-
-    async def dm(self, name: str, msg: str, url: str = ''):
-        u = self._find_user(name)
-        if not u:
-            return self.logger.warning(f"[Dm]: {name} - not found.")
-
-        messages = self._splitMessage(msg)
-        if url:
-            messages[0]['url'] = url
-        for x in messages:
-            x['to'] = u['id']
-            await self.__cmd(x)
-
-
-    async def _user_action(self, name: str, action: str, cmd_key: str, save_user: bool = False):
-        """Helper method for user actions (kick, ban, report)"""
-        user = self._find_user(name)
+    async def dm(self, name=None, msg: str = '', url: str = '', *, user_id=None, to_tc=None, loudness=None):
+        user = self._resolve_user(name, user_id)
         if not user:
-            self.logger.warning(f"[{action}]: {name} - not found.")
-            return None
+            return Response(0, {}, None, 'rejected', 'User not found')
+        extra = {'to': user['id']}
+        trip = to_tc if to_tc is not None else user.get('tripcode')
+        if trip:
+            extra['to-tc'] = trip
+        return await self._send_messages(msg, url, loudness=loudness, extra=extra)
 
-        if save_user:
-            self._users[name] = user
+    async def _send_messages(self, message, url='', *, loudness=None, mention=None, extra=None):
+        if loudness is not None and loudness not in (1, 2, 3, 5):
+            raise ValueError('loudness must be 1, 2, 3 or 5')
+        parts = self._splitMessage(message)
+        if not parts:
+            if not url:
+                return Response(0, {}, None, 'rejected', 'Empty message')
+            parts = [{'message': ''}]
+        results = []
+        for index, part in enumerate(parts):
+            if index == 0 and url:
+                part['url'] = url
+            if loudness is not None:
+                part['loudness'] = str(loudness)
+            if mention is not None:
+                part['mention'] = mention if isinstance(mention, str) else ','.join(map(str, mention))
+            part.update(extra or {})
+            result = await self.__cmd(part)
+            results.append(result)
+            if not result.ok:
+                break
+        # Single messages keep the same result contract as other commands;
+        # callers can inspect every chunk for a long message.
+        return Response(result.status, result.headers, result.text,
+                        result.outcome, result.message, results)
 
-        return await self.__cmd({cmd_key: user['id']})
+    async def _user_action(self, name, key, *, user_id=None, save_user=False, extra=None):
+        user = self._resolve_user(name, user_id)
+        if not user:
+            return Response(0, {}, None, 'rejected', 'User not found')
+        result = await self.__cmd({key: user['id'], **(extra or {})})
+        if result.ok and save_user:
+            self._users[name or user['id']] = user
+        return result
 
+    async def kick(self, name=None, *, user_id=None):
+        return await self._user_action(name, 'kick', user_id=user_id)
 
-    async def kick(self, name: str):
-        return await self._user_action(name, 'Kick', 'kick')
+    async def ban(self, name=None, *, user_id=None):
+        return await self._user_action(name, 'ban', user_id=user_id, save_user=True)
 
+    async def report(self, name=None, *, user_id=None, report_type='username', report_reason='other', message_id=None):
+        if report_type not in ('username', 'content') or report_reason not in ('spam', 'harassment', 'nsfw', 'entry_after_ban', 'other'):
+            raise ValueError('Invalid report type or reason')
+        extra = {'report_type': report_type, 'report_reason': report_reason}
+        if message_id:
+            extra['message_id'] = message_id
+        return await self._user_action(name, 'report_and_ban_user', user_id=user_id, save_user=True, extra=extra)
 
-    async def ban(self, name: str):
-        return await self._user_action(name, 'Ban', 'ban', save_user=True)
-
-
-    async def report(self, name: str):
-        return await self._user_action(name, 'Report', 'report_and_ban_user', save_user=True)
-
-
-    async def unban(self, name: str):
-        user = self._users.get(name)
-        if user:
-            return await self.__cmd({'unban': user['id'], 'userName': name})
-        return None
-
+    async def unban(self, name=None, *, user_id=None):
+        return await self._user_action(name, 'unban', user_id=user_id)
 
     async def leave(self):
         result = await self.__cmd({'leave': 'leave'})
-        # Explicitly set location to lounge after leaving
-        self.loc = 'lounge'
-        self.room = {}
-        self.users = []
-        self.logger.debug("leave: set loc to lounge")
+        if result.ok:
+            self._reset_room()
+            self.loc = 'lounge'
+            if self.loopId:
+                self.loopId.restart()
         return result
 
+    async def logout(self):
+        await self.closeLoop()
+        try:
+            result = (await self._post(f'{DRRRUrl}/logout/', {})).classify()
+            check = await self._get(f'{DRRRUrl}/profile/?api=json')
+            if isinstance(check.text, dict) and check.text.get('profile', {}).get('id'):
+                return Response(check.status, check.headers, check.text, 'rejected', 'Logout not confirmed')
+            if check.status not in (200, 401, 403):
+                return check.classify()
+            if not isinstance(check.text, dict) or 'redirect' not in check.text or str(check.text['redirect']).strip('/') != '':
+                return Response(check.status, check.headers, check.text, 'rejected', 'Logout not confirmed')
+            self._reset_room()
+            self.loc = 'lounge'
+            self.profile['cookie'] = ''
+            self.profile['authorization'] = ''
+            self.profile.pop('id', None)
+            self.session.cookie_jar.clear()
+            if self.reuse_session:
+                write_json(self.session_name, self.profile)
+            result.outcome = 'success'
+            return result
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            return Response(0, {}, None, 'network_error', type(exc).__name__)
+
+    async def music_full(self, mode: bool):
+        return await self.__cmd({'music_full_mode': str(bool(mode)).lower()})
+
+    async def history_marker(self):
+        return await self.__cmd({'history_marker': '1'})
+
+    async def skip(self, count=1):
+        if int(count) < 1:
+            raise ValueError('count must be positive')
+        return await self.msg('/skip ' + str(int(count)))
+
+    async def shuffle(self):
+        return await self.msg('/shuffle')
+
+    async def music_start(self):
+        return await self.msg('/start')
+
+    async def music_stop(self):
+        return await self.msg('/stop')
+
+    async def music_clear(self):
+        return await self.msg('/clear')
 
 # Example usage:
 # async def main():

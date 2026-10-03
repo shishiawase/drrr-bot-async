@@ -5,6 +5,8 @@ Asynchronous Python library for creating bots on [drrr.com](https://drrr.com).
 ## Features
 
 - Fully asynchronous (built on `aiohttp` and `asyncio`)
+- Socket.IO over WebSocket for incoming events (no periodic `/json.php` requests)
+- Automatic reconnect, cursor recovery, acknowledgements, and bounded deduplication
 - Browser-free authentication with challenge solving
 - Event system with decorators
 - Timers and delayed tasks
@@ -13,13 +15,12 @@ Asynchronous Python library for creating bots on [drrr.com](https://drrr.com).
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.9+
 
 ## Installation
 
 ```bash
-# Required
-pip install aiohttp
+pip install -r requirements.txt
 ```
 
 ## Quick Start
@@ -61,6 +62,10 @@ await bot.login()
 ```
 
 The login flow requests the page, parses the token and challenge fields, solves the proof-of-work challenge, then submits the form with the challenged payload.
+JSON login responses are supported; a successful login is confirmed through the
+authenticated profile endpoint. Proof of work runs in a worker thread so it does
+not block WebSocket heartbeat. If entering a room requires a separate challenge,
+`join()` obtains it from `/room_join/` and submits the confirmed join via HTTP POST.
 
 If the challenge difficulty is `7`, solving can take a long time. It is recommended to check the challenge difficulty before solving; when it is `7`, wait before trying to register or log in again.
 
@@ -99,8 +104,50 @@ bot = Bot(
 | `await bot.login()` | Login to drrr.com |
 | `bot.save(name='config')` | Save profile to file |
 | `await bot.load(name='config')` | Load profile from file |
-| `bot.startLoop(seconds=0.8)` | Start update loop |
-| `bot.stopLoop()` | Stop update loop |
+| `bot.startLoop(seconds=0.8)` | Start WebSocket reception; `seconds` sets the initial retry delay |
+| `bot.stopLoop()` | Request cancellation of WebSocket reception |
+| `await bot.closeLoop()` | Stop reception and wait for background tasks to finish |
+| `await bot.getRoomUpdate()` | Read the local room snapshot without a network request |
+
+### WebSocket behavior
+
+Authentication, room creation/joining, and outgoing commands continue to use HTTP.
+Incoming events use `/conn/`, Engine.IO v4, and `version=4.1`, with the same session
+cookies as HTTP. Namespace authentication sends `last_time` to recover missed events.
+`new-talk` acknowledgements and Engine.IO heartbeat are handled by `python-socketio`.
+
+`startLoop()` can be called before joining a room. In the lounge it waits for
+`join()`/`create()` instead of polling. Joining another room resets the cursor and
+deduplication cache. Leaving or being kicked stops reception until another room
+is joined. Reconnect delays increase to a maximum of 30 seconds after failures.
+An explicit `stopLoop()` is asynchronous cancellation; use `await closeLoop()`
+before immediately starting another receiver. Exiting `async with Bot(...)` closes
+both reception and the HTTP session.
+
+The initial room snapshot is loaded once and its existing history is not dispatched
+as new commands. Events are processed sequentially; one failing handler does not
+stop other handlers. Server recovery history is finite: a `truncated` result is
+logged and room state is refreshed, but messages no longer retained by the server
+cannot be recovered. `getRoomUpdate()` returns the latest locally known state;
+use `getRoom()` if a fresh HTTP snapshot is explicitly needed.
+
+### Verification
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q drrr_async.py drrr_socket.py tests
+python -m pip check
+```
+
+Tests run against a local Socket.IO server. They verify WebSocket-only transport,
+cookie forwarding, acknowledgements, heartbeat, reconnect/recovery, duplicate
+suppression, membership state, HTTP command compatibility, and task cleanup.
+They do not post messages to drrr.com or require live credentials.
+
+Live verification on 2026-10-03 also passed with two temporary bots in a hidden
+room: authentication, room entry, public/private messages, forced disconnect and
+recovery without duplicates, server heartbeat, and member departure. Both bots
+left the test room and their sessions were closed.
 
 ### Room Management
 
@@ -384,7 +431,7 @@ await bot.msg('Hello!')
 ```
 
 ### Cookie expired
-Delete old profile and login again:
+Expired saved sessions are discarded automatically by `login()`. To remove a saved session manually:
 ```bash
 rm ./configs/config.json
 ```
@@ -395,8 +442,96 @@ rm ./configs/config.json
 - Room description: max 140 characters
 - Message: max 135 characters (auto-split)
 - Room limit: 2-20 users
-- Update interval: 0.8-1.0 seconds recommended
+- Room updates arrive through WebSocket; no polling interval is required.
 
 ## License
 
 Free to use.
+
+## Authentication and proof of work
+
+`Bot` saves authenticated sessions in `configs/session-*.json` and validates them
+before reuse. A valid session skips the login challenge; an expired session triggers
+fresh login. Network failures during validation are propagated without creating a
+new session. `configs/` is excluded from Git.
+
+```python
+bot = Bot(name='MyBot', reuse_session=True, pow_workers=4, pow_timeout=300)
+```
+
+The default worker count is at most four processes and leaves one logical CPU free
+where possible. Workers search separate counter ranges and stop when one finds a
+solution, the time limit expires, or the coroutine is cancelled. Both login and
+room-join challenges use this solver. `pow_timeout` is in seconds; there is no fixed
+counter limit. Set `reuse_session=False` to disable automatic saving and reuse, or
+`session_name='my-session'` to choose the local filename.
+
+On Windows, start the application under `if __name__ == '__main__':`, as in the
+examples above, because workers use multiprocessing with `spawn`.
+# HTTP API: results and additional arguments
+
+Room commands now return `Response` with `status`, `headers`, `text`,
+`outcome`, `message`, and `ok`. JSON and plain server responses are preserved.
+`outcome` distinguishes `success`, `duplicate`, `rejected`, `rate_limited`,
+`server_error`, `network_error`, `timeout`, and `unknown`.
+Unrecognized HTTP 200 text is `unknown`: inspect its message or verify
+room state instead of assuming the operation succeeded.
+An HTTP 200 warning is a rejection, not a successful command.
+`duplicate` (208) acknowledges an already handled request ID; the original
+response may have been lost, so verify room state when the action matters.
+
+```python
+async with Bot(name='MyBot', tripcode='your-tripcode',
+               command_attempts=3, command_timeout=30,
+               command_interval=1.1) as bot:
+    if not await bot.login():
+        raise RuntimeError('Login failed')
+    result = await bot.create(name='Room', hidden=True, music=True,
+                              music_full_mode=True)
+    if not result.ok:
+        print(result.outcome, result.message)
+```
+
+Retries reuse `X-Request-ID` and increment `X-Retry-Count`. Only transport
+failures and server errors are retried. Authorization failures and rate
+warnings terminate the command; choose a later retry explicitly.
+`command_timeout` limits execution including its retries; commands wait
+for the serialization lock before execution. Cancellation releases the lock.
+
+Additional APIs:
+
+```python
+await bot.msg('hello', loudness=3, mention=['user-id'])
+await bot.dm(user_id='user-id', msg='hello', to_tc='recipient-tripcode')
+await bot.host(user_id='user-id')
+await bot.kick(user_id='user-id')
+await bot.ban(user_id='user-id')
+await bot.unban(user_id='user-id')  # no local ban cache required
+# Sends a real report AND ban; call only when intended:
+await bot.report(user_id='user-id', report_type='content',
+                 report_reason='spam', message_id='message-id')
+await bot.music('song', 'https://example.com/song.mp3', queue='last')
+await bot.skip(count=2)
+await bot.shuffle()
+await bot.music_start()
+await bot.music_stop()
+await bot.music_clear()
+await bot.music_full(True)
+await bot.history_marker()
+await bot.leave()
+await bot.logout()
+```
+
+Existing positional name-based calls remain supported. `queue` accepts
+`first`, `last`, or `None`; report types are `username`/`content`, reasons
+are `spam`, `harassment`, `nsfw`, `entry_after_ban`, and `other`.
+Long messages split at 140 graphemes, preserve whitespace and a leading
+`/me ` prefix, and return per-chunk responses in `result.parts`.
+Sending stops on the first failed chunk. URL-only messages are supported.
+
+`join()` confirms the requested room ID and the bot's membership before
+returning success. A stale JSON `Already in room` response is reconciled
+by leaving the stale session state and requesting a fresh join challenge.
+`logout()` closes reception, verifies loss of authentication, and clears
+the local session cookie/cache. The tripcode secret is not written to the
+session cache; its hash separates cache identities.
