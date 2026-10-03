@@ -500,16 +500,44 @@ for the serialization lock before execution. Cancellation releases the lock.
 
 Additional APIs:
 
+Use a nickname for ordinary commands; the bot resolves it to a user ID:
+
 ```python
-await bot.msg('hello', loudness=3, mention=['user-id'])
-await bot.dm(user_id='user-id', msg='hello', to_tc='recipient-tripcode')
-await bot.host(user_id='user-id')
-await bot.kick(user_id='user-id')
-await bot.ban(user_id='user-id')
-await bot.unban(user_id='user-id')  # no local ban cache required
+await bot.msg('hello', loudness=3)
+await bot.dm('Alice', 'hello')
+await bot.host('Alice')
+await bot.kick('Alice')
+await bot.ban('Alice')
+await bot.unban('Alice')  # requires Alice in the local user cache
 # Sends a real report AND ban; call only when intended:
-await bot.report(user_id='user-id', report_type='content',
+await bot.report('Alice', report_type='content',
                  report_reason='spam', message_id='message-id')
+```
+
+Nicknames must match exactly, including case. The bot and recipient must
+be in the same room for direct messages. If several participants share a
+nickname, the current lookup chooses the first match; use an ID to select
+a specific participant. Current participant IDs are available in `bot.users`:
+
+```python
+for user in bot.users:
+    print(user['name'], user['id'])
+```
+
+`dm`, `host`, `kick`, `ban`, `unban`, and `report` also accept `user_id`
+instead of a nickname. Replace the example IDs with actual user IDs.
+Unbanning by ID does not require the user to be in the local cache.
+`mention` specifically takes user IDs, as a list or a comma-separated string:
+
+```python
+await bot.dm(user_id='user-id', msg='hello', to_tc='recipient-tripcode')
+await bot.unban(user_id='user-id')
+await bot.msg('hello Alice', loudness=3, mention=['user-id'])
+```
+
+Other room and session commands:
+
+```python
 await bot.music('song', 'https://example.com/song.mp3', queue='last')
 await bot.skip(count=2)
 await bot.shuffle()
