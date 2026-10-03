@@ -90,7 +90,9 @@ class RoomSocket:
         try:
             while True:
                 try:
-                    await self.bot._update(initial=not self.bot.lastTime)
+                    snapshot = await self.bot._update(initial=not self.bot.lastTime)
+                    if snapshot.outcome in ('network_error', 'timeout', 'server_error'):
+                        raise aiohttp.ClientConnectionError('Room snapshot unavailable')
                     break
                 except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
                     self.bot.logger.warning('Initial room snapshot failed; retry in %.1fs', delay)

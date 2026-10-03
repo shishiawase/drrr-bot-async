@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock
 import aiohttp
-from drrr_async import Bot
+from drrr_async import Bot, Response
 from drrr_socket import RoomSocket
 
 class HistoryGaps(unittest.IsolatedAsyncioTestCase):
@@ -17,7 +17,7 @@ class HistoryGaps(unittest.IsolatedAsyncioTestCase):
 
     async def test_truncated_replay_emits_after_restoring_state(self):
         RoomSocket(self.bot, 'https://example.com')._make_client()
-        self.bot.getRoom = AsyncMock(return_value={'room': {'id':'r1','users':[{'id':'new'}]}})
+        self.bot.getRoom = AsyncMock(return_value=Response(200, {}, {'room': {'id':'r1','users':[{'id':'new'}]}}).classify())
         await self.bot._on_socket_event('rewind', {'talks':[
             {'id':'replay','time':14,'type':'message','content':'hello'}]})
         await self.bot._on_socket_event('rewind-done', {'now':15,'truncated':True})
@@ -43,7 +43,7 @@ class HistoryGaps(unittest.IsolatedAsyncioTestCase):
 
     async def test_snapshot_failures_still_emit_gap(self):
         for value in (None, {'error':'Forbidden'}, {'unexpected':True}):
-            self.bot.getRoom = AsyncMock(return_value=value)
+            self.bot.getRoom = AsyncMock(return_value=Response(200, {}, value, 'invalid_response', 'Invalid room snapshot'))
             await self.bot._on_socket_event('rewind-done', {'now':15,'truncated':True})
             self.assertFalse(self.gaps[-1].snapshot_restored)
         self.assertEqual(len(self.gaps), 3)
@@ -58,7 +58,7 @@ class HistoryGaps(unittest.IsolatedAsyncioTestCase):
         async def switched():
             self.bot._reset_room()
             self.bot.room = {'id':'r2'}
-            return {'room':{'id':'r1','users':[]}}
+            return Response(200, {}, {'room':{'id':'r1','users':[]}}).classify()
         self.bot.getRoom = switched
         await self.bot._on_socket_event('rewind-done', {'now':15,'truncated':True})
         self.assertEqual(self.gaps, [])

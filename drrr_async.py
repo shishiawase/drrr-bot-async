@@ -31,6 +31,9 @@ class Response:
     def ok(self):
         return self.outcome in ('success', 'duplicate')
 
+    def __bool__(self):
+        return self.ok
+
     def classify(self):
         if self.outcome:
             return self
@@ -38,6 +41,8 @@ class Response:
         self.message = str(body.get('error') or body.get('message') or '') if isinstance(body, dict) else str(body or '')
         if self.status == 208:
             self.outcome = 'duplicate'
+        elif self.status == 401:
+            self.outcome = 'unauthorized'
         elif self.status == 429 or 'posting too fast' in self.message.lower():
             self.outcome = 'rate_limited'
         elif self.status >= 500:
@@ -63,7 +68,7 @@ class _FormFields(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == 'input' and attrs.get('name'):
-            self.fields[attrs['name']] = attrs.get('value', attrs.get('data-value', ''))
+            self.fields[attrs['name']] = attrs.get('value') or attrs.get('data-value', '')
 
 def read_json(name: str) -> Optional[dict]:
     if not os.path.isfile(f'./configs/{name}.json'):
@@ -252,7 +257,7 @@ class Bot:
         return result
 
 
-    async def login(self):
+    async def login(self) -> Response:
         requested_profile = self.profile.copy()
         if self.reuse_session:
             try:
@@ -265,91 +270,62 @@ class Bot:
                 self.profile['cookie'] = cached['cookie']
                 self.profile['authorization'] = cached.get('authorization', '')
             if self.profile.get('cookie'):
-                profile = await self.getProfile()
+                profile = (await self.getProfile()).classify()
                 current = profile.text.get('profile', {}) if isinstance(profile.text, dict) else {}
-                if profile.status == 200 and current.get('id') and current.get('name') == requested_profile['name']:
+                if profile.ok and isinstance(current, dict) and current.get('id') and current.get('name') == requested_profile['name']:
                     self.logger.info('Reusing authenticated session')
-                    return True
-                if profile.status not in (200, 401, 403):
-                    raise aiohttp.ClientConnectionError('Cannot validate saved session')
+                    return profile
+                if profile.outcome in ('network_error', 'timeout', 'server_error', 'rate_limited', 'invalid_response'):
+                    return profile
                 self.profile = requested_profile
                 self.profile['cookie'] = ''
                 self.profile['authorization'] = ''
                 self.session.cookie_jar.clear()
-        # HTML login flow: GET / -> parse challenge -> POST / with challenged payload.
-        headers = {'User-Agent': self.profile['device'], 'Cookie': self.profile['cookie']}
-
-        async with self.session.get(f'{DRRRUrl}/', headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as res:
-            html = await res.text()
-
-        token_m = re.search(r'name="token"[^>]*data-value="([^"]+)"', html)
-        nonce_m = re.search(r'name="nonce"\s+value="([^"]+)"', html)
-        ts_m = re.search(r'name="timestamp"\s+value="([^"]+)"', html)
-        diff_m = re.search(r'name="difficulty"\s+value="([^"]+)"', html)
-
-        if not (token_m and nonce_m and ts_m and diff_m):
-            self.logger.error("Cannot parse token/challenge fields from HTML login page.")
-            return False
-
-        token = token_m.group(1)
-        challenge = {
-            'nonce': nonce_m.group(1),
-            'timestamp': ts_m.group(1),
-            'difficulty': int(diff_m.group(1)),
-        }
-        self.logger.info(f"Challenge received (difficulty: {challenge.get('difficulty')})")
-
-        # Proof of work must not block active sockets and their heartbeat.
-        solution = await self._solve_challenge(challenge)
-        if not solution:
-            self.logger.error("Failed to solve challenge")
-            return False
-
-        form = {
-            'name': self.profile['name'],
-            'tripcode': self.tripcode,
-            'token': token,
-            'nonce': challenge['nonce'],
-            'timestamp': str(challenge['timestamp']),
-            'difficulty': str(challenge['difficulty']),
-            'challenged': solution,
-            'language': self.profile['lang'],
-            'icon': self.profile['icon'],
-        }
-
-        post_headers = {
-            'User-Agent': self.profile['device'],
-            'Cookie': self.profile['cookie'],
-            'Content-Type': 'application/x-www-form-urlencoded',
-        }
-        async with self.session.post(f'{DRRRUrl}/', headers=post_headers, data=form, timeout=aiohttp.ClientTimeout(total=10)) as res:
-            body = await res.text()
-            set_cookie = res.headers.get('set-cookie', '')
-            status = res.status
-
-        if set_cookie:
-            self.profile['cookie'] = set_cookie.partition(';')[0]
-
-        # Current server returns JSON instead of the historical lounge HTML.
+        page = (await self._get(f'{DRRRUrl}/')).classify()
+        if (not 200 <= page.status < 300
+                or page.outcome in ('rejected', 'rate_limited', 'unauthorized')):
+            return page
+        fields = _FormFields()
+        if isinstance(page.text, str):
+            fields.feed(page.text)
+        challenge = fields.fields
+        if not all(challenge.get(k) for k in ('token', 'nonce', 'timestamp', 'difficulty')):
+            page.outcome, page.message = 'invalid_response', 'Login challenge fields are missing'
+            return page
         try:
-            reply = json.loads(body)
-        except json.JSONDecodeError:
-            reply = {}
-        if not isinstance(reply, dict):
-            reply = {}
-        if status >= 400 or reply.get('error'):
-            self.logger.error('Login failed: server rejected authentication.')
-            return False
-        if 'authorization' in reply:
-            self.profile['authorization'] = reply['authorization']
+            difficulty = int(challenge['difficulty'])
+            if not 0 <= difficulty <= 64:
+                raise ValueError('Invalid SHA-256 difficulty')
+        except (TypeError, ValueError):
+            page.outcome, page.message = 'invalid_response', 'Invalid login challenge difficulty'
+            return page
+        try:
+            solution = await self._solve_challenge({
+                'nonce': challenge['nonce'], 'timestamp': challenge['timestamp'], 'difficulty': difficulty})
+        except (OSError, RuntimeError) as exc:
+            return Response(0, {}, None, 'local_error', type(exc).__name__)
+        if solution is None:
+            return Response(page.status, page.headers, page.text, 'timeout', 'Login challenge time budget expired')
+        result = (await self._post(f'{DRRRUrl}/', {
+            'name': self.profile['name'], 'tripcode': self.tripcode,
+            'token': challenge['token'], 'nonce': challenge['nonce'],
+            'timestamp': challenge['timestamp'], 'difficulty': str(difficulty),
+            'challenged': solution, 'language': self.profile['lang'], 'icon': self.profile['icon'],
+        })).classify()
+        if result.status in (401, 403):
+            result.outcome = 'unauthorized'
+        if not 200 <= result.status < 300 or result.outcome in ('rejected', 'rate_limited'):
+            return result
         profile = await self.getProfile()
-        if profile.status != 200 or not isinstance(profile.text, dict) or not profile.text.get('profile', {}).get('id'):
-            self.logger.error('Login failed: authenticated profile was not returned.')
-            return False
-        self.logger.info("Login ok")
+        if not profile.ok:
+            return profile
+        self.logger.info('Login ok')
         if self.reuse_session:
-            write_json(self.session_name, self.profile)
-        return True
+            try:
+                write_json(self.session_name, self.profile)
+            except OSError:
+                self.logger.warning('Authenticated session could not be saved')
+        return profile
 
 
     async def _parse_json(self, res):
@@ -376,7 +352,9 @@ class Bot:
                         cookies[key] = value.value
                     self.profile['cookie'] = '; '.join(key + '=' + value.value for key, value in cookies.items())
                 return Response(res.status, dict(res.headers), body).classify()
-        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+        except asyncio.TimeoutError as exc:
+            return Response(0, {}, None, 'timeout', type(exc).__name__)
+        except (aiohttp.ClientError, OSError) as exc:
             return Response(0, {}, None, 'network_error', type(exc).__name__)
 
     async def _post(self, url, cmd, use_json=False, headers=None):
@@ -390,19 +368,24 @@ class Bot:
         self.logger.info('Config saved')
 
 
-    async def load(self, name: str = 'config'):
-        obj = read_json(name)
-        if not obj:
-            return False
-
+    async def load(self, name: str = 'config') -> Response:
+        try:
+            obj = read_json(name)
+        except OSError as exc:
+            return Response(0, {}, None, 'local_error', type(exc).__name__)
+        except ValueError:
+            return Response(0, {}, None, 'invalid_response', 'Invalid session cache JSON')
+        if obj is None:
+            return Response(0, {}, None, 'rejected', 'Session cache not found')
+        if not isinstance(obj, dict) or not isinstance(obj.get('name'), str) or not isinstance(obj.get('cookie'), str):
+            return Response(0, {}, None, 'invalid_response', 'Invalid session cache fields')
         self.logger.name = f'DRRR({obj["name"]})'
         self.profile.update(obj)
-        self.logger.info('Config loaded')
         profile = await self.getProfile()
-        if not profile.ok or not self.profile.get('id'):
-            return False
-        await self._update(initial=True)
-        return True
+        if not profile.ok:
+            return profile
+        snapshot = await self._update(initial=True)
+        return profile if snapshot.ok else snapshot
 
 
     def _talksFilter(self, talks, time) -> List[Talk]:
@@ -462,28 +445,51 @@ class Bot:
         return next((u for u in self.users if u['name'] == name), None)
 
 
-    async def getProfile(self):
-        r = await self._get(f'{DRRRUrl}/profile/?api=json')
-        if r.status != 200:
-            self.logger.warning('[getProfile]: HTTP %s (%s)', r.status, r.outcome)
+    async def getProfile(self) -> Response:
+        r = (await self._get(f'{DRRRUrl}/profile/?api=json')).classify()
+        if r.status in (401, 403) or isinstance(r.text, dict) and 'redirect' in r.text:
+            r.outcome = 'unauthorized'
+            r.message = r.message or 'Authenticated profile is required'
             return r
-
-        if isinstance(r.text, dict):
-            self.profile.update(r.text.get('profile', {}))
+        if r.outcome not in ('success', 'unknown'):
+            return r
+        profile = r.text.get('profile') if isinstance(r.text, dict) else None
+        if not isinstance(profile, dict) or not profile.get('id'):
+            r.outcome, r.message = 'invalid_response', 'Authenticated profile was not returned'
+            return r
+        self.profile.update(profile)
+        r.outcome = 'success'
         return r
 
 
-    async def getRoom(self):
-        r = await self._get(f'{DRRRUrl}/room/?api=json')
-        if r.status != 200:
-            return self.logger.warning(f"[getRoom]: {r.status} {r.text}")
+    async def getRoom(self) -> Response:
+        r = (await self._get(f'{DRRRUrl}/room/?api=json')).classify()
+        if isinstance(r.text, dict) and 'redirect' in r.text:
+            r.outcome = 'unauthorized' if str(r.text['redirect']).strip('/') in ('', 'login') else 'rejected'
+            r.message = r.message or 'Room snapshot is unavailable'
+            return r
+        if r.outcome not in ('success', 'unknown'):
+            return r
+        room = r.text.get('room', r.text) if isinstance(r.text, dict) else None
+        valid = isinstance(room, dict) and any(k in room for k in ('id', 'room_id', 'roomId', 'users', 'talks'))
+        if valid:
+            for key in ('users', 'talks'):
+                for source in (room, r.text):
+                    values = source.get(key, [])
+                    if values is None:
+                        values = []
+                    valid = valid and isinstance(values, list) and all(isinstance(v, dict) for v in values)
+        if not valid:
+            r.outcome, r.message = 'invalid_response', 'Invalid room snapshot'
+            return r
+        r.outcome = 'success'
+        return r
 
-        return r.text
 
-
-    async def getRoomUpdate(self):
-        """Return the local room snapshot; updates arrive through Socket.IO."""
-        return dict(self.room)
+    async def getRoomUpdate(self) -> Response:
+        """Return a local snapshot; updates arrive through Socket.IO."""
+        return Response(200, {}, dict(self.room), 'success' if self.room else 'rejected',
+                        '' if self.room else 'Not in room')
 
 
     async def _checkMode(self, t, users):
@@ -582,16 +588,18 @@ class Bot:
             self._baseline_time = self.lastTime
         return True
 
-    async def _update(self, initial=False):
+    async def _update(self, initial=False) -> Response:
         """Fetch state once at startup/join/recovery, never on a polling timer."""
         generation = self._room_generation
         snapshot_started = time.time()
-        data = await self.getRoom()
+        result = await self.getRoom()
         if generation != self._room_generation:
-            return False
-        if data is None:
-            raise aiohttp.ClientConnectionError('Room snapshot unavailable')
-        return self._apply_room_snapshot(data, initial=initial, snapshot_started=snapshot_started)
+            return Response(result.status, result.headers, result.text, 'rejected', 'Room changed during snapshot')
+        if not result.ok:
+            return result
+        if not self._apply_room_snapshot(result.text, initial=initial, snapshot_started=snapshot_started):
+            result.outcome, result.message = 'invalid_response', 'Invalid room snapshot'
+        return result
 
     async def _on_socket_event(self, event, data):
         if event in ('leave', 'room-not-exist', 'not-in-any-room'):
@@ -856,14 +864,19 @@ class Bot:
         await self._manage_userlist('blacklist', add, False, remove, removeAll, on, mode)
 
 
-    async def lounge(self):
-        r = await self._get(f'{DRRRUrl}/lounge?api=json')
-        if r.status != 200:
+    async def lounge(self) -> Response:
+        r = (await self._get(f'{DRRRUrl}/lounge?api=json')).classify()
+        if r.outcome not in ('success', 'unknown'):
             return r
-        if not isinstance(r.text, dict) or 'rooms' not in r.text:
-            r.outcome = 'rejected'
+        if isinstance(r.text, dict) and 'redirect' in r.text:
+            r.outcome, r.message = 'unauthorized', r.message or 'Authenticated session is required'
             return r
-        self.rooms = r.text.get('rooms') or []
+        rooms = r.text.get('rooms') if isinstance(r.text, dict) else None
+        if not isinstance(rooms, list) or not all(isinstance(room, dict) for room in rooms):
+            r.outcome, r.message = 'invalid_response', 'Invalid lobby snapshot'
+            return r
+        self.rooms = rooms
+        r.outcome = 'success'
         return r
 
 
@@ -908,7 +921,7 @@ class Bot:
         if not confirmed:
             self._reset_room()
             self.loc = 'lounge'
-            return Response(r.status, r.headers, r.text, 'rejected', 'Room creation not confirmed')
+            return confirmed
         r.outcome = 'success'
         if self.loopId:
             self.loopId.restart()
@@ -929,7 +942,10 @@ class Bot:
                     reply.outcome = 'rejected'
                     return reply
             for attempt in range(2):
-                data = await self.getRoom()
+                snapshot = await self.getRoom()
+                if snapshot.outcome in ('unauthorized', 'network_error', 'timeout', 'server_error', 'rate_limited', 'invalid_response'):
+                    return snapshot
+                data = snapshot.text
                 room = data.get('room', data) if isinstance(data, dict) else {}
                 members = room.get('users', [])
                 own_id = self.profile.get('id')

@@ -81,7 +81,7 @@ class Events(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.seen), 1)
 
     async def test_initial_empty_snapshot_has_cursor_before_http_request(self):
-        self.bot.getRoom = AsyncMock(return_value={'room': {'id': 'r1', 'users': [], 'talks': []}})
+        self.bot.getRoom = AsyncMock(return_value=Response(200, {}, {'room': {'id': 'r1', 'users': [], 'talks': []}}).classify())
         with patch('drrr_async.time.time', return_value=9):
             await self.bot._update(initial=True)
         self.assertEqual(self.bot.lastTime, 9)
@@ -93,7 +93,7 @@ class Events(unittest.IsolatedAsyncioTestCase):
         async def snapshot():
             ready.set()
             await finish.wait()
-            return {'room': {'id': 'old', 'users': []}}
+            return Response(200, {}, {'room': {'id': 'old', 'users': []}}).classify()
         self.bot.getRoom = snapshot
         task = asyncio.create_task(self.bot._update())
         await ready.wait()
@@ -121,7 +121,7 @@ class Events(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([u['id'] for u in self.bot.users], ['u3'])
 
     async def test_rewind_done_advances_cursor_and_reports_truncation(self):
-        self.bot.getRoom = AsyncMock(return_value={'room': {'id': 'r1', 'users': [], 'talks': []}})
+        self.bot.getRoom = AsyncMock(return_value=Response(200, {}, {'room': {'id': 'r1', 'users': [], 'talks': []}}).classify())
         await self.bot._on_socket_event('rewind-done', {'now': 15})
         self.assertEqual(self.bot.lastTime, 15)
         self.bot.getRoom.assert_not_awaited()
@@ -167,7 +167,7 @@ class Wire(unittest.IsolatedAsyncioTestCase):
         self.bot = Bot()
         await self.bot.__aenter__()
         self.bot.profile['cookie'] = 'drrr-session-1=test-session'
-        self.bot.getRoom = AsyncMock(return_value={'room': {'id': 'r1', 'users': [], 'talks': []}})
+        self.bot.getRoom = AsyncMock(return_value=Response(200, {}, {'room': {'id': 'r1', 'users': [], 'talks': []}}).classify())
         self.seen = asyncio.Queue()
 
         @self.bot.event(types=['msg'])
@@ -228,13 +228,13 @@ class Wire(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bot.session.closed)
 
     async def test_lounge_waits_for_join_without_polling(self):
-        self.bot.getRoom.return_value = {'error': 'Not in room'}
+        self.bot.getRoom.return_value = Response(200, {}, {'error': 'Not in room'}).classify()
         self.bot.startLoop(seconds=0.01)
         await asyncio.sleep(0.15)
         self.assertTrue(self.connected.empty())
         self.bot.getRoom.assert_awaited_once()
         self.bot.profile['id'] = 'me'
-        self.bot.getRoom.return_value = {'room': {'id': 'r2', 'users': [{'id': 'me'}], 'talks': []}}
+        self.bot.getRoom.return_value = Response(200, {}, {'room': {'id': 'r2', 'users': [{'id': 'me'}], 'talks': []}}).classify()
         self.bot._get = AsyncMock(return_value=Response(200, {}, {}))
         await self.bot.join('r2')
         await self.next(self.connected)
@@ -243,7 +243,7 @@ class Wire(unittest.IsolatedAsyncioTestCase):
 
     async def test_startup_snapshot_failure_is_retried(self):
         self.bot.getRoom.side_effect = [aiohttp.ClientConnectionError('temporary'),
-                                        {'room': {'id': 'r1', 'users': [], 'talks': []}}]
+                                        Response(200, {}, {'room': {'id': 'r1', 'users': [], 'talks': []}}).classify()]
         self.bot.startLoop(seconds=0.01)
         await self.next(self.connected)
         await self.next(self.configs)
@@ -282,7 +282,7 @@ class Wire(unittest.IsolatedAsyncioTestCase):
         old_cursor = self.bot.lastTime
         await self.sio.call('rewind', {'talks':[talk('replay',11)]}, to=sid, timeout=2)
         await self.next(self.seen)
-        self.bot.getRoom.return_value = {'room':{'id':'r1','users':[{'id':'updated'}]}}
+        self.bot.getRoom.return_value = Response(200, {}, {'room':{'id':'r1','users':[{'id':'updated'}]}}).classify()
         await self.sio.call('rewind-done', {'now':15,'truncated':True}, to=sid, timeout=2)
         event = await self.next(gaps)
         self.assertEqual((event.room_id,event.old_cursor,event.new_cursor), ('r1',old_cursor,15))
@@ -314,7 +314,7 @@ class Login(unittest.IsolatedAsyncioTestCase):
                 bot.profile.update(name='Other', icon='other', id='wrong')
                 return Response(200, {}, {'profile': {'name': 'Other', 'id': 'wrong'}})
             bot.getProfile = wrong_profile
-            bot.session.get = unittest.mock.Mock(side_effect=RuntimeError('fresh login'))
+            bot._get = AsyncMock(side_effect=RuntimeError('fresh login'))
             with self.assertRaisesRegex(RuntimeError, 'fresh login'):
                 await bot.login()
             self.assertEqual(bot.profile['name'], 'Cached')
@@ -327,8 +327,8 @@ class Login(unittest.IsolatedAsyncioTestCase):
         async with Bot(name='Cached') as bot:
             bot.getProfile = AsyncMock(return_value=Response(503, {}, {}))
             bot.session.get = unittest.mock.Mock(side_effect=AssertionError('unexpected login'))
-            with self.assertRaises(aiohttp.ClientConnectionError):
-                await bot.login()
+            result = await bot.login()
+            self.assertEqual(result.outcome, 'server_error')
             self.assertEqual(bot.profile['cookie'], 'cached')
 
     async def test_join_handles_room_join_challenge(self):
@@ -353,8 +353,8 @@ class Login(unittest.IsolatedAsyncioTestCase):
                         return Response(403, {}, {'redirect': 'room_join'})
                     bot._get = AsyncMock(side_effect=initial_then_page)
                     bot._post = AsyncMock(return_value=Response(200, {}, {'redirect': '/room/'}))
-                    bot.getRoom = AsyncMock(side_effect=[{'room': {'id': 'r2', 'users': [], 'talks': []}},
-                        {'room': {'id': 'r2', 'users': [{'id': 'me'}], 'talks': []}}])
+                    bot.getRoom = AsyncMock(side_effect=[Response(200, {}, {'room': {'id': 'r2', 'users': [], 'talks': []}}).classify(),
+                        Response(200, {}, {'room': {'id': 'r2', 'users': [{'id': 'me'}], 'talks': []}}).classify()])
                     response = await bot.join('r2')
                     self.assertEqual(response.status, 200)
                     self.assertEqual(bot.loc, 'room')
@@ -390,7 +390,10 @@ class Login(unittest.IsolatedAsyncioTestCase):
         try:
             with patch('drrr_async.DRRRUrl', url):
                 async with Bot(name='LoginTest') as bot:
-                    self.assertTrue(await bot.login())
+                    result = await bot.login()
+                    self.assertIsInstance(result, Response)
+                    self.assertTrue(result.ok)
+                    self.assertEqual(result.text['profile']['id'], 'test-user')
                     self.assertIn('test-login-cookie', self.cookie)
                     self.assertEqual(bot.profile['id'], 'test-user')
                     self.assertEqual(bot.profile['authorization'], 'test-auth')

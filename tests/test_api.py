@@ -147,8 +147,8 @@ class Join(unittest.IsolatedAsyncioTestCase):
             Response(200, {}, {'redirect':'room','message':'Already in room'}),
             Response(200, {}, '<input value="n" name="nonce"><input value="1" name="timestamp"><input value="0" name="difficulty">')])
         bot._solve_challenge = AsyncMock(return_value='solution')
-        bot.getRoom = AsyncMock(side_effect=[{'room':{'id':'r1','users':[]}},
-            {'room':{'id':'r1','users':[{'id':'me'}]}}])
+        bot.getRoom = AsyncMock(side_effect=[Response(200, {}, {'room':{'id':'r1','users':[]}}).classify(),
+            Response(200, {}, {'room':{'id':'r1','users':[{'id':'me'}]}}).classify()])
         bot._post = AsyncMock(side_effect=[Response(200, {}, '/lounge'), Response(200, {}, {'redirect':'room'})])
         self.assertTrue((await bot.join('r1')).ok)
         self.assertEqual(bot._post.await_args_list[0].args[1], {'leave':'leave'})
@@ -158,7 +158,7 @@ class Join(unittest.IsolatedAsyncioTestCase):
     async def test_does_not_accept_non_member_snapshot(self):
         bot = Bot(); bot.profile['id'] = 'me'
         bot._get = AsyncMock(return_value=Response(200, {}, {'redirect':'room'}))
-        bot.getRoom = AsyncMock(return_value={'room':{'id':'r1','users':[{'id':'other'}]}})
+        bot.getRoom = AsyncMock(return_value=Response(200, {}, {'room':{'id':'r1','users':[{'id':'other'}]}}).classify())
         bot._post = AsyncMock(return_value=Response(200, {}, {'error':'blocked'}))
         response = MagicMock(status=200)
         response.text = AsyncMock(return_value='{"redirect":"room","message":"Already in room"}')

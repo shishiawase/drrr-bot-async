@@ -101,13 +101,15 @@ bot = Bot(
 
 | Method | Description |
 |--------|-------------|
-| `await bot.login()` | Login to drrr.com |
+| `await bot.login()` | Authenticate; return `Response` with the verified profile |
 | `bot.save(name='config')` | Save profile to file |
-| `await bot.load(name='config')` | Load profile from file |
+| `await bot.load(name='config')` | Load and validate a saved session and room; return `Response` |
 | `bot.startLoop(seconds=0.8)` | Start WebSocket reception; `seconds` sets the initial retry delay |
 | `bot.stopLoop()` | Request cancellation of WebSocket reception |
 | `await bot.closeLoop()` | Stop reception and wait for background tasks to finish |
-| `await bot.getRoomUpdate()` | Read the local room snapshot without a network request |
+| `await bot.getProfile()` | Fetch and validate the authenticated profile; return `Response` |
+| `await bot.getRoom()` | Fetch and validate the room snapshot; return `Response` |
+| `await bot.getRoomUpdate()` | Return the local snapshot in `Response.text` without a network request |
 
 ### WebSocket behavior
 
@@ -128,7 +130,7 @@ The initial room snapshot is loaded once and its existing history is not dispatc
 as new commands. Events are processed sequentially; one failing handler does not
 stop other handlers. Server recovery history is finite: a `truncated` result is
 logged and room state is refreshed, but messages no longer retained by the server
-cannot be recovered. `getRoomUpdate()` returns the latest locally known state;
+cannot be recovered. `(await bot.getRoomUpdate()).text` contains the latest locally known state;
 use `getRoom()` if a fresh HTTP snapshot is explicitly needed.
 
 ### Verification
@@ -297,7 +299,7 @@ async def waifu(talk):
     async with aiohttp.ClientSession() as session:
         async with session.get('https://api.waifu.im/images', params={"IncludedTags": "waifu"}) as resp:
             data = await resp.json()
-            await bot.msg('♥', data["items"][0]["url"])
+            await bot.msg('в™Ґ', data["items"][0]["url"])
 ```
 
 ### Periodic Announcements
@@ -470,10 +472,40 @@ On Windows, start the application under `if __name__ == '__main__':`, as in the
 examples above, because workers use multiprocessing with `spawn`.
 # HTTP API: results and additional arguments
 
-Room commands now return `Response` with `status`, `headers`, `text`,
+HTTP commands, `login()`, `load()`, `getProfile()`, `getRoom()`, and
+`getRoomUpdate()` return `Response` with `status`, `headers`, `text`,
 `outcome`, `message`, and `ok`. JSON and plain server responses are preserved.
-`outcome` distinguishes `success`, `duplicate`, `rejected`, `rate_limited`,
-`server_error`, `network_error`, `timeout`, and `unknown`.
+`outcome` distinguishes `success`, `duplicate`, `rejected`, `unauthorized`,
+`rate_limited`, `server_error`, `network_error`, `timeout`, `invalid_response`,
+`local_error`, and `unknown`. `unauthorized` means authentication is required
+or denied; ordinary room permission failures remain `rejected`.
+`invalid_response` means an expected profile/room/lobby or cached JSON payload
+is malformed. `local_error` reports a saved-session file read failure or a challenge worker failure.
+A valid login still succeeds if optional session saving fails; that failure
+is logged. Cancellation propagates as `asyncio.CancelledError`.
+
+Migration: login/load now return an object rather than `bool`. Boolean checks
+such as `if await bot.login()` still work because `bool(result) == result.ok`;
+use `.ok`, not `is True`. Room getters now return the payload in `.text`
+rather than returning a dictionary directly. `login()` returns the verified
+profile response. `load()` validates both the profile and room snapshot;
+it returns the profile on success or the failed response, preserving the
+reason. `getRoomUpdate()` returns `rejected` if no room snapshot is known.
+Local helpers such as `save()`, timers, and event registration keep their
+existing return contracts.
+
+```python
+result = await bot.login()
+if not result.ok:
+    print(result.outcome, result.status, result.message)
+else:
+    result = await bot.getRoom()
+    if result.ok:
+        room = result.text.get('room', result.text)
+        print(room.get('users', []))
+    else:
+        print(result.outcome, result.message)
+```
 Unrecognized HTTP 200 text is `unknown`: inspect its message or verify
 room state instead of assuming the operation succeeded.
 An HTTP 200 warning is a rejection, not a successful command.
@@ -484,8 +516,9 @@ response may have been lost, so verify room state when the action matters.
 async with Bot(name='MyBot', tripcode='your-tripcode',
                command_attempts=3, command_timeout=30,
                command_interval=1.1) as bot:
-    if not await bot.login():
-        raise RuntimeError('Login failed')
+    login = await bot.login()
+    if not login.ok:
+        raise RuntimeError(f'{login.outcome}: {login.message}')
     result = await bot.create(name='Room', hidden=True, music=True,
                               music_full_mode=True)
     if not result.ok:
