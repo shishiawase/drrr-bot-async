@@ -53,6 +53,7 @@ class RoomSocket:
             http_session=self.bot.session, request_timeout=10,
         )
         generation = self.bot._room_generation
+        self.bot._recovery_cursor = self.bot.lastTime
 
         @client.event
         async def connect():

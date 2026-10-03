@@ -199,7 +199,7 @@ async def handler(talk):
     pass
 ```
 
-**Event types:** `msg`, `dm`, `me`, `join`, `leave`, `new-host`, `room-profile`, `music`, `kick`, `ban`
+**Event types:** `msg`, `dm`, `me`, `join`, `leave`, `new-host`, `room-profile`, `music`, `kick`, `ban`, `history-gap`
 
 ### Timers
 
@@ -508,6 +508,27 @@ must cooperate with cancellation and avoid blocking the event loop.
 Synchronous handlers run in a worker thread; they must be thread-safe, and
 a timed-out thread can continue running because Python cannot forcibly stop
 it. Prefer async handlers for network calls and bot commands.
+
+When the server reports truncated recovery history, the module attempts to
+refresh the room state, then emits `history-gap`. The event does not represent
+a chat message and is not added to room history. Normal reception continues.
+
+```python
+@bot.event(types=['history-gap'])
+async def on_history_gap(gap):
+    print(f'History gap in room {gap.room_id}: '
+          f'{gap.old_cursor} -> {gap.new_cursor}; '
+          f'room state refreshed: {gap.snapshot_restored}')
+    # Your application can notify its owner through Telegram here.
+```
+
+`old_cursor` is the last known timestamp before replay on this connection;
+`new_cursor` is the timestamp at recovery completion. These mark the possible
+gap, not the exact times or count of missing messages. `snapshot_restored` is
+false if the room refresh fails; the event still fires. Switching rooms during
+refresh discards the old room's notification. The same `event_timeout` and
+handler error isolation apply. Telegram integration belongs in the application;
+the module does not send Telegram notifications itself.
 
 Additional APIs:
 

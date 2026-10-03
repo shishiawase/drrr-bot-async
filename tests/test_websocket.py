@@ -272,6 +272,26 @@ class Wire(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.next(self.seen), 'hello')
 
 
+    async def test_truncated_recovery_notifies_application_over_socket(self):
+        gaps = asyncio.Queue()
+        @self.bot.event(types=['history-gap'])
+        async def gap(event): await gaps.put(event)
+        self.bot.startLoop()
+        sid = await self.next(self.connected)
+        await self.next(self.configs)
+        old_cursor = self.bot.lastTime
+        await self.sio.call('rewind', {'talks':[talk('replay',11)]}, to=sid, timeout=2)
+        await self.next(self.seen)
+        self.bot.getRoom.return_value = {'room':{'id':'r1','users':[{'id':'updated'}]}}
+        await self.sio.call('rewind-done', {'now':15,'truncated':True}, to=sid, timeout=2)
+        event = await self.next(gaps)
+        self.assertEqual((event.room_id,event.old_cursor,event.new_cursor), ('r1',old_cursor,15))
+        self.assertTrue(event.snapshot_restored)
+        self.assertEqual(self.bot.users, [{'id':'updated'}])
+        self.assertEqual(self.bot.getRoom.await_count, 2)
+        self.assertTrue(self.bot.loopId.connected)
+
+
 class Login(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.read_cache = patch('drrr_async.read_json', return_value=None).start()

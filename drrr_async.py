@@ -113,6 +113,15 @@ class Talk:
     msg: str
 
 
+@dataclass
+class HistoryGap(Talk):
+    """Recovery metadata; cursors do not imply an exact lost-message count."""
+    room_id: str = ''
+    old_cursor: float = 0
+    new_cursor: float = 0
+    snapshot_restored: bool = False
+
+
 class Timer:
     def __init__(self, t: float, func, args: tuple = ()):
         self.name = f'DRRR Timer ({func.__name__})'
@@ -217,6 +226,7 @@ class Bot:
         self._room_generation = 0
         self._seen_talks = OrderedDict()
         self._baseline_time = 0
+        self._recovery_cursor = None
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -535,6 +545,7 @@ class Bot:
         self._room_generation += 1
         self.lastTime = 0
         self._baseline_time = 0
+        self._recovery_cursor = None
         self._seen_talks.clear()
         self.room = {}
         self.users = []
@@ -595,10 +606,25 @@ class Bot:
             return
         if event == 'rewind-done':
             if isinstance(data, dict):
+                old_cursor = self._recovery_cursor if self._recovery_cursor is not None else self.lastTime
+                self._recovery_cursor = None
                 self.lastTime = max(self.lastTime, data.get('now', 0))
                 if data.get('truncated'):
+                    generation = self._room_generation
+                    room_id = str(self.room.get('id') or self.room.get('room_id') or '')
+                    new_cursor = self.lastTime
                     self.logger.warning('Server recovery history truncated; some messages may be unavailable')
-                    await self._update()
+                    restored = False
+                    try:
+                        restored = await self._update()
+                    except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+                        self.logger.warning('Room snapshot after history gap failed: %s', type(exc).__name__)
+                    if generation == self._room_generation:
+                        await self._eventCall(self.events, [HistoryGap(
+                            type='history-gap', user='', url='', trip='',
+                            msg='Server recovery history truncated; some messages may be unavailable',
+                            room_id=room_id, old_cursor=old_cursor, new_cursor=new_cursor,
+                            snapshot_restored=bool(restored))])
             return
         if event == 'rewind':
             talks = data.get('talks', []) if isinstance(data, dict) else []
@@ -714,7 +740,7 @@ class Bot:
 
     def event(self, types: List[str] = [], command: str = '', users: List[str] = []):
         type_list = ["msg", "dm", "me", "join", "leave", "new-host",
-        "new-description", "room-profile", "user-profile", "music", "playlist", "playlist-add", "kick", "ban", "unban"]
+        "new-description", "room-profile", "user-profile", "music", "playlist", "playlist-add", "kick", "ban", "unban", "history-gap"]
 
         for i in types:
             if i not in type_list:
